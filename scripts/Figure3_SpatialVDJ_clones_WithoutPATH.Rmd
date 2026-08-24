@@ -1,0 +1,1958 @@
+---
+title: "SpatialVDJ - Clonal analysis vs TLS cluster"
+author: "Guilhem Pupier"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  rmdformats::readthedown:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In order to analyze BCR and TCR clones in a ccRCC tumors samples at a scale closer to single cell, we used the [SpatialVDJ](https://www.science.org/doi/10.1126/science.adf8486?url_ver=Z39.88-2003&rfr_id=ori:rid:crossref.org&rfr_dat=cr_pub%20%200pubmed) method developped by Engblom et al. It is an adaptation of Visium (10X Genomics) on Fresh Frozen slices with a capture of BCR and TCR full length cDNA, before fragmentation, and long read sequencing using PacBio sequencing platform. On an other part, spatial gene expression is also performed.
+
+The goal is to analyze BCR and TCR relationships regarding to TLS : clonal evolution (expansion, SHM, CSR) vs TLS at spatial resolution.
+
+Sections :
+
+- **Preprocess** :  
+All pre-process step of **SpatialVDJ** data following clonotype preparation (see script Figure2_SpatialVDJ_clonotypes.Rmd) adding clonal grouping step and lineage tree reconstruction.    
+
+- **Reload merged dataset** :  
+Reload data to generate plots.
+
+- **Figures** : 
+Script to reproduce Figure 3 and S8.  
+
+# Load required packages
+
+
+```{r,eval=T}
+library(STutility)
+library(Seurat) # to manage spatial transcriptomic data
+
+library(parallel) # parApply ...
+
+library(patchwork)
+library(ggplot2)
+library(ggpubr)
+library(ggalluvial)
+library(grid)
+library(gridExtra)
+library(scales) # plot functions
+#from Heather Turner @stackoverflow ## Adapt y scale in log scale 
+base_breaksLog10 <- function(n = 10){
+  function(x) {
+    axisTicks(log10(range(x, na.rm = TRUE)), log = T, n = n)
+  }
+}
+
+base_breaksLog1p <- function(n = 10){
+  function(x) {
+    axisTicks(log1p(range(x, na.rm = TRUE)), log = T, n = n)
+  }
+}
+
+
+library(pastecs)
+library(RColorBrewer)
+library(viridis) # color palettes
+
+library(stringi)
+library(stringr) # string manipulations
+
+library(dplyr) 
+library(tidyr)
+library(reshape2) # table manipulations
+
+# from Maxime Meylan
+plot_contingency <- function(data,
+           variables = c("TLS_pos", "HBV"),
+           hide_legend = F,
+           text_size=6,
+           create_labels = T,
+           inverse_factor2=F,
+           order_factor=NULL,
+           palette = NA,
+           test_name = c("chisq.test", "fisher.test")[1],
+           labs = c(xlab = "",
+                    ylab = "",
+                    legend_title = ""),
+           hide_test = F,
+           title = ""){
+    if(inverse_factor2){
+      data[,variables[2]] <- factor(data[,variables[2]],levels=rev(levels(data[,variables[2]])))
+    }
+    cont_table <- table(data[,variables[1]],data[,variables[2]])
+    #clean data table to avoid empty rows
+    non_empty_rows <- rowSums(cont_table)!=0
+    cont_table <- cont_table[non_empty_rows,]
+
+    if(create_labels){
+      #sapply(levels(factor(data[,variables[2]])), function(x) paste(variables[2],x,sep="_"))
+      colnames(cont_table) <- sapply(levels(factor(data[,variables[2]])), function(x) paste(variables[2],x,sep="_"))
+      rownames(cont_table) <- sapply(levels(factor(data[,variables[1]])), function(x) paste(variables[1],x,sep="_"))
+    }
+  if(test_name != "fisher.test" & test_name != "chisq.test"){
+    stop("incorrect test, valid options are fisher.test or chisq.test")
+  }
+  if(test_name == "fisher.test"){
+    error_test <-  if(class(try(fisher.test(cont_table),silent=T)) == "try-error"){
+      test_res <- fisher.test(cont_table,simulate.p.value = T)
+    }else{
+      test_res <- fisher.test(cont_table)
+    }
+  }
+  if(test_name == "chisq.test"){
+    test_res <- chisq.test(cont_table)
+  }
+  #make sure there is a matrix (enough values in both sides)
+  if(!is.null(dim(cont_table))){
+    cont_table_perc <-apply(cont_table,1,function(x) {
+      res <- x / sum(x) *100
+    })
+    cont_table_m <- reshape2::melt(cont_table_perc)
+    cont_table_m$Var1 <- factor(cont_table_m$Var1)
+    p <- ggplot(data=cont_table_m, aes(x=Var2,y=value,fill=Var1,label=value))
+    p <- p + geom_bar(stat="identity",width=0.95)
+    #to reverse order of bars
+    #p <- p + geom_bar(stat="identity",width=0.95,position = position_stack(reverse = TRUE))
+    p <- p + geom_text(label = paste0(as.vector(t(cont_table)),"\n(",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+    p <- p + theme_minimal()
+
+    if(any(!is.na(palette))){
+      p <- p + scale_fill_manual(values = palette)
+    }
+    #p <- p + theme(legend.title = element_blank())#,axis.text.x = element_text(angle = 25, hjust = 1))
+    p <- p + guides(fill=guide_legend(title=labs[3]))
+    if(hide_test){
+      p <- p + labs(subtitle=paste("p = ",format(test_res$p.value,digits=3),sep=" "),title=title,x=labs[1],y=labs[2])
+      if(test_res$p.value < 0.05 ) p <- p + theme(plot.subtitle=element_text(face="bold"))
+    }else{
+      p <- p + labs(subtitle=paste(test_name, " p = ",format(test_res$p.value,digits=3),sep=" "),title=title,x=labs[1],y=labs[2])
+      if(test_res$p.value < 0.05 ) p <- p + theme(plot.subtitle=element_text(face="bold"))
+    }
+
+    if(hide_legend){
+      p <- p + guides(fill=FALSE)
+    }
+  }else{
+    p <- ggplot()
+    test_res <-1
+  }
+  return(list(p,test_res,cont_table))
+
+}
+
+library(scatterpie)
+library(ggfun) 
+library(ggforce) # Packages for spatial pie plot
+geom_scatterpie_edit <- function (mapping = NULL, data, cols, pie_scale = 1, sorted_by_radius = FALSE, 
+    legend_name = "type", long_format = FALSE, ...) 
+{
+    if (is.null(mapping)) 
+        mapping <- aes_(x = ~x, y = ~y)
+    mapping <- modifyList(mapping, aes_(r0 = 0, fill = as.formula(paste0("~", 
+        legend_name)), amount = ~value))
+    if (!"r" %in% names(mapping)) {
+        xvar <- get_aes_var(mapping, "x")
+        size <- 5                         ###### Change here to get always the same size of pie
+        data$r <- size
+        mapping <- modifyList(mapping, aes_(r = size))
+    }
+    names(mapping)[match(c("x", "y"), names(mapping))] <- c("x0", 
+        "y0")
+    if (long_format == TRUE) {
+        df <- data
+        names(df)[which(names(df) == cols)] = legend_name
+        cols2 <- enquo(cols)
+    }
+    else {
+        data <- data[rowSums(data[, cols]) > 0, ]
+        cols2 <- enquo(cols)
+        df <- gather(data, "type", "value", !!cols2)
+        df$type <- factor(df$type, levels = cols)
+        names(df)[which(names(df) == "type")] = legend_name
+    }
+    if (!"group" %in% names(mapping)) {
+        xvar <- get_aes_var(mapping, "x0")
+        yvar <- get_aes_var(mapping, "y0")
+        df <- as.list(dplyr::group_split(dplyr::group_by(df, 
+            !!xvar, !!yvar)))
+        names(df) <- seq_len(length(df))
+        df <- dplyr::bind_rows(df, .id = ".group.id")
+        mapping <- modifyList(mapping, aes_(group = ~.group.id))
+    }
+    if (!sorted_by_radius) {
+        return(geom_arc_bar(mapping, data = df, stat = "pie", 
+            inherit.aes = FALSE, ...))
+    }
+    if ("r" %in% colnames(df)) {
+        rvar <- "r"
+    }
+    else {
+        rvar <- get_aes_var(mapping, "r")
+    }
+    lapply(split(df, df[, rvar, drop = TRUE])[as.character(sort(unique(df[, 
+        rvar, drop = TRUE]), decreasing = TRUE))], function(d) {
+        geom_arc_bar(mapping, data = d, stat = "pie", inherit.aes = FALSE, 
+            ...)
+    })
+}
+ 
+
+### Packages for repertoire
+library(airr)
+library(data.table) # function fread() for efficient and fast read of tab file
+library(alakazam)
+library(shazam)
+
+library(dowser) # lineage tree with Immcantation pipeline
+
+library(ggtree) 
+library(ggraph)
+library(tidygraph) # reshape tree with ggplot/tidygraph
+
+## pretty palette
+my_colors <- c("#66b803", "#f94144", "#f8961e", "#3574b8", "#DE77AE", "#9970AB", "#D5E4A2", "#71D0F5", "#B1746F", "#ADE2D0", "#20DE8BFF", "#CCDE8BFF", "#f7f31c", "#FFA88BFF", "#FF6A8BFF")
+
+# Give the path of the Immcantation folder : repertoire data for SpatialVDJ preprocessed with Immcantation pipeline (see paper method). With a back / at the end
+ImmcantationFolder <- "PATH/"
+
+# Load table of identifier matching with anonym and original id : Table not shared due to patient privacy requirement. Only anonym id provided (original id not necessary to reproduce the script. Just need to adapt corresponding lines)
+Anonym_table <- "" # not shared
+
+# Following vector are just built for consistency with original script. Again, just need to adapt with the correct id shared
+#### A vecotr name FileID contained the SpatialVDJ id
+FileID <- Anonym_table$SpatialVDJ_id
+names(FileID) <- FileID
+
+#### A vector named IDmatch contained the SpatialGEX id and SpatialVDJ in names
+IDmatch <- Anonym_table$SpatialGEX_id
+names(IDmatch) <- FileID
+
+# Output folder to retrieve the files and plot
+res_folder <-"PATH/Figure3_S8/"
+```
+
+# Preprocess - Not rendered
+
+## SpatialVDJ clonal grouping
+
+All script bellow are run only one time - not re run for plot/render markdown. 
+They should be considered with preprocess steps of the previous script :  Figure2_SpatialVDJ_clonotypes.Rmd
+
+Note : the final clonotype tables (1 table per sample) generated from previous script were named as follow (file_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI.tsv). The file 20260721_airr_igblast-db_full_database.tsv provided corresponds to a merge of all individual clonotype table (see previous script,Figure2_SpatialVDJ_clonotypes.Rmd, section Merged all seurat and all metadata).
+
+### Clustering sequences into clonal groups
+
+
+#### Calculate the Distance to the Nearest Distribution and find a threshold
+
+```{r,eval=F}
+
+SampleId <- Anonym_table$SpatialVDJ_id
+
+IDmatch <- Anonym_table$SpatialGEX_id
+names(IDmatch) <- SampleId
+
+
+for(file in SampleId){
+  # Do not need to adapt from here - path of Igblast quality filtered database
+  file_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI.tsv")
+  
+  # Load airr 
+  airr <- read_rearrangement(file_path)
+  
+  airr_heavy <- airr %>%
+  filter(locus == "IGH")
+  
+  # Open a file connection for writing a log file ##un comment if needed
+  sink(paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igh_dist_nearest_and_threshold_log.txt"), append = FALSE, type = c("output"))
+  
+  print(paste("Dimension of the IGH repertoire :",dim(airr_heavy)[[1]],"x",dim(airr_heavy)[[2]]))
+  
+  print(paste("Start distToNearest for file :",file))
+  t1 <- Sys.time()
+  airr_heavy <- distToNearest(airr_heavy, sequenceColumn="junction",vCallColumn="v_call", jCallColumn="j_call", model="ham", first=FALSE, normalize="len", nproc=12)
+  t2 <- Sys.time()
+  print(paste("distToNearest time with nproc=12 - Hamming length normalize :"))
+  print(t2-t1)
+  
+  print(paste("Start findThreshold for file :",file))
+  t1 <- Sys.time()
+  threshold <- findThreshold(airr_heavy[["dist_nearest"]], method="density")
+  t2 <- Sys.time()
+  print(paste("findThreshold time :"))
+  print(t2-t1)
+  
+  clone_threshold <- round(threshold@threshold,digits = 2) 
+  
+  print(paste("findThreshold - density method - round 2 digits :",clone_threshold))
+  
+  # Close the sink connection to save the output to the file ## un comment if needed
+  sink()
+  
+  #Save the plot
+  #create directory to store results per file
+  if(!file.exists(paste0(res_folder,"03_IgBlast/Clone_Dist_Threshold"))) dir.create(paste0(res_folder,"03_IgBlast/Clone_Dist_Threshold")) 
+
+  p<-plot(threshold, binwidth=0.02, silent=FALSE)
+  pdf(paste0(res_folder,"03_IgBlast/Clone_Dist_Threshold/",file,"_Hamming_length_normalized_igh_threshold.pdf"), width = 8, height = 7)
+  print(p)
+  dev.off()
+
+  # Save the repertoire data after collapse duplicates
+  write_rearrangement(airr_heavy, file=paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist.tsv"))
+  
+  rm(list=setdiff(ls(),c("FileID","SampleId","IDmatch","ImmcantationFolder","res_folder")))
+  gc()
+  
+}
+
+```
+
+#### Define clones
+
+Define clone according to previously defined threshold. 
+Create germline according to clone information.
+
+```{bash,eval=F}
+# in a environment : conda activate pRESTO
+
+LongRead_dir="PATH/"
+
+cd ${LongRead_dir}
+
+#List file 
+files=`cat "${LongRead_dir}sampleId_batch1_run3_SMRTbellCRC.txt"`
+
+for file in $files; do
+
+  echo $file
+  
+  in="${LongRead_dir}Immcantation/8_PostIgBlastFilter/${file}_igh_dist_nearest_and_threshold_log.txt"
+  out="${LongRead_dir}Immcantation/8_PostIgBlastFilter/${file}_igh_dist_nearest_and_threshold.log"
+  
+  # first sed remove [1] "
+  # Second sed remove remaining "
+  # Third sed remoe explicit \n lign
+  
+  cat $in | sed -E "s/^\[.{4}//g" | sed -E "s/\"//g" | sed -E "s/^.n$//g" > $out
+  
+  #Retrieve thresold from log of the correct sample.
+  ## read log ## get the lign : 
+  Threshlog="${LongRead_dir}Immcantation/8_PostIgBlastFilter/${file}_igh_dist_nearest_and_threshold.log"
+  threshold=`grep "findThreshold - density method - round 2 digits : " $Threshlog | sed "s/findThreshold.*: //g"`
+  
+  # If threshold is NA or threshold is greater than 0.15, then replace by 0.15
+  if [[ "$threshold" == "NA" || $(echo "$threshold > 0.15" | bc -l) -eq 1 ]]; then
+    threshold=0.15
+  fi
+  
+echo "Runing DefineClones.py"
+DefineClones.py -d "${LongRead_dir}Immcantation/8_PostIgBlastFilter/${file}_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist.tsv" --model ham --norm len --dist $threshold --mode gene --act set --nproc 12 --outdir "${LongRead_dir}Immcantation/8_PostIgBlastFilter/" --format airr --log "${LongRead_dir}Immcantation/8_PostIgBlastFilter/${file}_DefineClone.log" >> "${LongRead_dir}Immcantation/pipeline_log/${file}_ChangeO_and_PostProcess_perf.log" 2>&1
+
+echo "Runing CreateGermlines.py"
+CreateGermlines.py -d "${LongRead_dir}Immcantation/8_PostIgBlastFilter/${file}_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass.tsv" -r PATH/germlines/imgt/human/vdj -g dmask --format airr --cloned --outdir "${LongRead_dir}Immcantation/8_PostIgBlastFilter/" >> "${LongRead_dir}Immcantation/pipeline_log/${file}_ChangeO_and_PostProcess_perf.log" 2>&1
+
+done
+
+```
+
+
+
+### Clonal lineage tree analysis with Immcantation pipeline
+
+This script is provided (regular Immcantation lineage tree analysis) but is not actualy used in the final analysis / article >> see TRIBAL lineage tree section after.
+
+```{r,eval=FALSE}
+library(dowser)
+library(alakazam)
+library(airr)
+library(dplyr)
+library(ggtree)
+```
+
+
+```{r,eval=F}
+
+SampleId <- Anonym_table$SpatialVDJ_id
+
+IDmatch <- Anonym_table$SpatialGEX_id
+names(IDmatch) <- SampleId
+
+
+for(file in FileID){
+  
+  #folder to save plot
+  if(!file.exists(paste0(res_folder,"03_IgBlast/IGHclones/",file))) dir.create(paste0(res_folder,"03_IgBlast/IGHclones/",file)) 
+  
+  
+  # Do not need to adapt from here - path of Igblast quality filtered database
+  file_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass.tsv")
+  
+  # Load airr 
+  airr <- read_rearrangement(file_path)
+  
+  # Open a file connection for writing a log file ##un comment if needed
+  sink(paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igh_cloneTree_log.txt"), append = FALSE, type = c("output"))
+  
+  print(paste("number of unique clone_id :",length(unique(airr$clone_id))))
+
+  # 1. Format
+  
+  airr$read_count <- as.numeric(airr$read_count)
+
+  ## format sequence_id column in order to shorter it (it was concatenated by all sequences collapsed : choose only one sequence id, the first one ...)
+  airr$sequence_id <-gsub(",.*","",airr$sequence_id)
+  
+  ## format c_imgt_form so that it do not takes to many space in the plot (as label) : either M, S or ?
+  airr$simplified_form<-ifelse(airr$c_imgtref_form=="Secreted",yes = "S",
+                               no = ifelse(airr$c_imgtref_form=="Membrane",yes = "M",no = "?"))
+  #airr$simplified_form_bold<-ifelse(airr$simplified_form=="M",yes = "bold",no = "plain")
+  
+  print(paste("Start formatClones nproc=10 for file :",file))
+  
+  warning(paste(file,"1st clones formating"))
+  
+  t1 <- Sys.time()
+  clones <- formatClones(airr, traits=c("isotype","c_imgtref_form","sb","simplified_form"),num_fields=c("read_count","umi_count"),text_fields = c("clonotype_id","sb","sb_umi"), columns=c("d_call"), minseq=2,nproc=10)
+  t2 <- Sys.time()
+  print(paste("formatClones time to convert IGH repertoire in a clone data table - 10 threads - minseq=2 :"))
+  print(t2-t1)
+  
+  print(paste("Number of IGH clones with min 2 Seq - Polytomy by SB :",length(clones$clone_id)))
+  
+  # 2. Build the Trees
+  # build maximum parsimony trees 
+  
+  print(paste("Start getTrees nproc=10 for file :",file))
+  
+  t1 <- Sys.time()
+  clones <- getTrees(clones ,nproc = 10)
+  clones <- scaleBranches(clones, edge_type = "mutations") # make a scale in mutations number (easier to interprete)
+  t2 <- Sys.time()
+  print(paste("getTrees time to convert IGH repertoire in a clone data table - 10 threads - Min 2 Seq :"))
+  print(t2-t1)
+  
+  # 3. Visualize
+  # Plot the trees. Save them in a list of plots. 
+  # Use tip metadata: isotype and collapse_count
+  
+  color_palette <- c("IGHM"="#253494", "IGHD"="#1D91C0", "IGHG1"="#d62728", "IGHG2"="#ff7f0e",  "IGHG3"="#FF6EC7", "IGHG4"="#FCCF05", "IGHA1"="#2ca02c", "IGHA2"="#36e40a","IGHE"="#8c564b","IGH_NA"="grey")
+  
+  print(paste("Start plotTrees for file :",file))
+
+  t1 <- Sys.time()
+  tree_plots <- plotTrees(clones,tips ="isotype", tipsize="umi_count", tip_palette=c(color_palette, "Germline"="#000000"),layout = "roundrect",scale=1)
+  names(tree_plots)<-clones$clone_id
+  
+  warning(paste(file,"1st clones format - save plot"))
+  
+  tree_plots <- lapply(clones$clone_id,function(clnID){
+    plot<-tree_plots[[clnID]]
+    plot<-plot+
+      geom_tiplab(aes(label=simplified_form),offset = -1,size=2.5,hjust = +0.5)+ # Add S,M,? information at the tip for the form of IGH
+      ggtree::layout_dendrogram() # switch as a dendrogram with germline in the top
+    
+    ggsave(plot = plot,
+           filename = paste0(res_folder,"03_IgBlast/IGHclones/",file,"/","Dowser_MaxParsimonyTree_Iso&Form_PolytomyBySB_IGHclone",clnID,".pdf"),
+           width = 8,height = 4)
+    
+    plot
+  })
+  
+  t2 <- Sys.time()
+  print(paste("plotTrees time"))
+  print(t2-t1)
+  
+  #Save the RDS in 8_PostIgBlastFilter
+  saveRDS(clones,paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igh_clones_datatable_MaxParsimony_PolytomyBySB.rds"))
+  saveRDS(tree_plots, paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igh_clones_treePlot_MaxParsimony_Iso&Form_PolytomyBySB.rds"))
+
+  
+  ##### 2nd version of Tree plot - Collapse by clonotype : size of spots in the tree is the number of spots
+  warning(paste(file,"2nd clones formating"))
+  
+  clones <- formatClones(airr, traits=c("isotype","c_imgtref_form","simplified_form"),num_fields=c("read_count","umi_count"),text_fields = c("clonotype_id","sb","sb_umi"), columns=c("d_call"), minseq=2,nproc=10)
+  clones <- getTrees(clones ,nproc = 10)
+  clones <- scaleBranches(clones, edge_type = "mutations") 
+  
+  print(paste("Number of IGH clones with min 2 Seq - Collapsed by clonotype :",length(clones$clone_id)))
+  
+  tree_plots <- plotTrees(clones,tips ="isotype", tipsize="collapse_count", tip_palette=c(color_palette, "Germline"="#000000"),layout = "roundrect",scale=1)
+  names(tree_plots)<-clones$clone_id
+  
+  
+  warning(paste(file,"2nd clones format - save plot"))
+  tree_plots <- lapply(clones$clone_id,function(clnID){
+      plot<-tree_plots[[clnID]]
+      plot<-plot+
+        geom_tiplab(aes(label=simplified_form),offset = -1,size=2.5,hjust = +0.5)+ # Add S,M,? information at the tip for the form of IGH
+        ggtree::layout_dendrogram()+ # switch as a dendrogram with germline in the top
+        labs(size="Spot_count")
+      
+      ggsave(plot = plot,
+             filename = paste0(res_folder,"03_IgBlast/IGHclones/",file,"/","Dowser_MaxParsimonyTree_Iso&Form_CollapseByClonotype_IGHclone",clnID,".pdf"),
+             width = 8,height = 4)
+      
+      plot
+    })
+  
+  #Save the RDS in 8_PostIgBlastFilter
+  saveRDS(clones,paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igh_clones_datatable_MaxParsimony_CollapseByClonotype.rds"))
+  saveRDS(tree_plots, paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igh_clones_treePlot_MaxParsimony_Iso&Form_CollapseByClonotype.rds"))
+  
+  
+  # Close the sink connection to save the output to the file ## un comment if needed
+  sink()
+  
+  rm(list=setdiff(ls(),c("FileID","SampleId","IDmatch","ImmcantationFolder","res_folder")))
+  gc()
+  
+}
+
+
+```
+
+### New clonal lineage analysis with TRIBAL
+
+TRIBAL is a new method of Tree inference of B cell clonal lineages (TRIBAL) which jointly model the evolutionary processes of somatic hypermutation and class switch recombination (isotype away !).
+NB: see github [TRIBAL](https://github.com/elkebir-group/TRIBAL)
+
+It was initially developped for single cell VDJ data with isotype information available. I want to use this software with only IGH clonotypes from SpatialVDJ Long read and Isotype calling in order to improve the lineage tree by adding the class switch information.
+
+From the github ;
+
+The cli has two sub-commands:
+
+preprocess - filter the data and find a multiple sequence alignment and parsimony forsest for each clonotype.
+fit - infer a set of optimal B cell lineage trees per clonotype an a shared isotype transition probability matrix.
+
+Preprocess:
+The preprocessing command will: 1. filter out clonotypes that are below the minimum number of cells 2. filter out cells which have v alleles that differ from the majority of the clonotype 3. perform a multiple sequence alignment (MSA) for each valid clonotype using mafft 4. infer a parsimony forest for each clonotype given the MSA using dnapars
+The --data, --roots and --encoding are required arguments. See data description for more details. The --encoding argument should be that path to a text file that lists the correct isotype ordering as well as the isotype labels that are present in the input data.
+
+Fit:
+The fit sub-command will infer a set of B cell lineage trees for each clonotype and a shared isotype transition probability matrix.
+The pickled dictionary of clonotypes clonotypes.pkl that is output from tribal preprocess will be the input to tribal fit.
+There are four optional outputs from tribal fit:
+--transmat-infer: the inferred isotype transition probability matrix.
+--pickle : a dictionary with clonotype id as key and value is a LineageTreeList containing the optimal lineage trees for each clonotype.
+--score : a csv file containing the SHM parsimony scores and CSR likelihood.
+--write-results : a directory where the lineage trees files will be saved including:
+a fasta file containing the inferred BCR sequences,
+a csv file containing the inferred isotypes,
+a text file containing the edge list of the lineage tree,
+a png file containing a visualization of the lineage tree.
+
+#### Prepare input files
+
+To run TRIBAL, 3 input files are required:
+
+The sequencing data : a csv file with the following columns :
+
+- cellid : unqiue id or barcode of the sequenced B cell. Here, because it is SpatialVDJ data and in a same spatial barcode (SB) there can be multiple clonotypes (unique sequences from different cells), the cellid will be a concatenate between the SB tag and the clonotype_id tags  
+- clonotype : unique clonotype id to which that cell belongs , i.e., groups of cells that descend from the same naive B cell receptor. In this case, it corresponds to the clone groups, ie clone_id.  
+- heavy_chain_isotype : c_call IGHG1, IGHA1, IGHE ...  
+- heavy_chain_allele : v_call : actually it is the v_gene col : choose only the best v_call allele)  
+- heavy_chain_seq : the variable region sequence of the heavy chain. In this case it correspond to the sequence_alignment column. Try with the AIRR format (with the dots), but if necessary, remoove the dots.  
+
+The germline clonotype roots sequences : a csv file with the following columns :
+
+- clonotype : unique clonotype id of the germline root (naive BCR). Here the clone_id  
+- heavy_chain_root :  heavy chain variable region germline root sequence. The germline_alignment sequence.  
+
+The encoding file (isotypes.txt) : a txt file with only one column, one isotype per line, ordered according to the genome. The example file contains only 8 isotypes for the human. IGHM, IGHG3, IGHG1, ... IGHE, IGHA2. There is no IGHD isotype in this file. For the first try, I will try to add the IGHD isotype just after the IGHM, as well as the IGH_NA, at the end of the file, to keep the maximum information.
+
+IMPORTANT NOTE : the sequence and germline alignment column from the IgBlast/AIRR format with dot is not working with TRIBAL. It seams to work with the dots replaced as N (should be checked that it is OK).
+
+```{r,eval=FALSE}
+SampleId <- Anonym_table$SpatialVDJ_id
+
+IDmatch <- Anonym_table$SpatialGEX_id
+names(IDmatch) <- SampleId
+
+
+for(file in FileID){
+  
+  #folder to save Input and output files from TRIBAL
+  if(!file.exists(paste0(ImmcantationFolder,"8_PostIgBlastFilter/TRIBAL_tree"))) dir.create(paste0(ImmcantationFolder,"8_PostIgBlastFilter/TRIBAL_tree")) 
+  
+  # PAth of the final IGH clone with germline reconstruct database
+  file_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass.tsv")
+  
+  # Load airr 
+  airr <- read_rearrangement(file_path)
+
+  ## Create a cell column by concatenating the SB and the clonotype_id
+  airr$cell <- paste(airr$sb,airr$clonotype_id,sep = "-")
+  
+  ## Add the string "Clonotype_" before the clone_id to match the required format of TRIBAL
+  #### NB : do not seams to be required : changed to Clone to avoid confusion
+  airr$clone_id <- paste0("Clone_",airr$clone_id)
+  
+  #replace _ by - because it seems to generate error in TRIBAL fit (key error)
+  airr$cell <- gsub("_","-",airr$cell)
+  
+  ## Sub in 2 data.frame with the required columns
+
+  ## TEST on 2 clones : one with only 1 clonotype, one with 4 clonotypes 
+  #### airr <- airr[airr$clone_id %in% c("Clone_1","Clone_140"),]
+  
+  
+  ### First SeqData
+  SeqData <- airr[,c("cell","clone_id","isotype","sequence_alignment","v_gene")]
+    ### rename column to fit the required input
+  colnames(SeqData)<- c("cell","clonotype","heavy_chain_isotype","heavy_chain_seq","heavy_chain_v_allele")
+  
+  #### TRY replacing all dots by N
+  SeqData$heavy_chain_seq <- str_replace_all(SeqData$heavy_chain_seq,"\\.","N")
+  
+  ### Then RootData
+  RootData <- airr[,c("clone_id","germline_alignment_d_mask")]
+    ### rename column to fit the required input
+  colnames(RootData)<- c("clonotype","heavy_chain_root")
+    ### Keep only one unique version per clone_id (all the germline_alignment are duplicated sequences) for one clone_id
+  RootData <- RootData[!duplicated(RootData$clonotype),]
+  #### TRY replacing all dots by N
+  RootData$heavy_chain_root <- str_replace_all(RootData$heavy_chain_root,"\\.","N")
+  
+  #Write Sequencing data csv
+  out_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/TRIBAL_tree/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass_TRIBAL_SeqData.csv")
+  write.csv(x = SeqData,file = out_path,quote = F,row.names = F)
+  
+  #Write Roots sequences csv
+  out_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/TRIBAL_tree/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass_TRIBAL_RootData.csv")
+  write.csv(x = RootData,file = out_path,quote = F,row.names = F)
+  
+}  
+
+
+```
+
+
+#### Run TRIBAL
+
+```{bash,eval=F}
+## Make sure to add the encoding txt file to the TRIBAL_tree folder
+mv PATH/20241028_HomoSapiens_isotypes_inSpatialVDJ_order.txt PATH/Processed_3rdRun/Immcantation/8_PostIgBlastFilter/TRIBAL_tree/
+
+#conda activate tribal
+
+###### Test TRIBAL with TEST DATA from Github repo in the folder PATH/test_TRIBAL/
+tribal preprocess --data "PATH/test_TRIBAL/data.csv"  \
+    --roots "PATH/test_TRIBAL/roots.csv" \
+    --encoding "PATH/test_TRIBAL/isotypes.txt" \
+    --min-size 2 \
+    --cores 3 \
+    --out "PATH/test_TRIBAL/clonotypes.pkl" \
+    --heavy
+
+tribal fit -c "PATH/test_TRIBAL/clonotypes.pkl" \
+  --n_isotypes 10 \
+  --mode refinement \
+  --cores 10 \
+  --transmat-infer "transmat.txt" \
+  --pickle "lineage_trees.pkl" \
+  --write-results "results" \
+  --score "objective.csv"
+
+
+
+###### TEST With a subset from my DATA (only 2 clones, one with 1 clonotype, 1 with 4 clonotypes)
+tribal preprocess --data "PATH/test_TRIBAL/TestTRIBAL_SeqData.csv"  \
+    --roots "PATH/test_TRIBAL/TestTRIBAL_RootData.csv" \
+    --encoding "PATH/test_TRIBAL/isotypes.txt" \
+    --min-size 2 \
+    --cores 3 \
+    --out "PATH/test_TRIBAL/TestTRIBAL_clonotypes.pkl" \
+    --heavy
+
+
+tribal fit -c "TestTRIBAL_clonotypes.pkl" \
+  --n_isotypes 10 \
+  --mode refinement \
+  --cores 10 \
+  --transmat-infer "TestTRIBALL_transmat.txt" \
+  --pickle "TestTRIBAL_lineage_trees.pkl" \
+  --write-results "TestTRIBAL_results" \
+  --score "TestTRIBAL_objective.csv"
+
+
+
+##### NB : There must be no underscore in cell id or it generates an error
+
+# conda deactivate (deactivate base)
+#conda activate tribal
+
+LongRead_dir="PATH/"
+
+cd ${LongRead_dir}
+
+#List file 
+files=`cat "${LongRead_dir}sampleId_batch1_run3_SMRTbellCRC.txt"`
+
+for file in $files; do
+
+  echo $file 
+
+
+  echo "run preprocess"
+  ## First run the preprocess command
+  #### Only on IGH because from SpatialVDJ I do not have paired clonotypes (Maybe can be used with repair inferred pairs ...)
+  ### --min-size : minimum clonotype size (default 4). Change it to 2 to be in a similar situation as Dowser package usage (above)
+  ### --cores : number of cores
+  ### --heavy : only use the heavy chain and ifnore the light chain
+  ### --dataframe : path to where the filtered dataframe with additional sequences and isotype encodings should be saved
+  ### --out : path to where pickled clonotype dictionary input should be saved (input of fit)
+  tribal preprocess --data "${LongRead_dir}Immcantation/8_PostIgBlastFilter/TRIBAL_tree/${file}_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass_TRIBAL_SeqData.csv"  \
+    --roots "${LongRead_dir}Immcantation/8_PostIgBlastFilter/TRIBAL_tree/${file}_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass_TRIBAL_RootData.csv" \
+    --encoding "PATH/Immcantation/8_PostIgBlastFilter/TRIBAL_tree/20241028_HomoSapiens_isotypes_inSpatialVDJ_order.txt" \
+    --min-size 2 \
+    --cores 3 \
+    --out "${LongRead_dir}Immcantation/8_PostIgBlastFilter/TRIBAL_tree/${file}/clonotypes.pkl" \
+    --heavy
+  
+  echo "run fit"
+  ## Then run the fit command
+  ### -c : clonotypes.pkl file output from prepaprocess command
+  ### --cores : number of thread
+  ### --transmat-infer: the inferred isotype transition probability matrix.
+  ### --pickle : a dictionary with clonotype id as key and value is a LineageTreeList containing the optimal lineage trees for each clonotype.
+  ### --score : a csv file containing the SHM parsimony scores and CSR likelihood.
+  ### --write-results : a directory where the lineage trees files
+  ### --mode :refinement (recommended) : the full algorithm where the CSR likelihood is optimized by solving the most parsimonious tree refinement problem. score : the input parsimony lineage trees are not refined and isotypes of the internal nodes are inferred using weighted parsimony via the Sankoff algorithm, with the isotype transition probabilities as weights
+  ###  --n_isotypes : the number of isotypes states to use
+  #  --stay-prob
+  #  --transmat
+  #  --niter
+  #  --thresh
+  #  --max-cand
+  #  --seed
+  #  --restarts
+  tribal fit -c "${LongRead_dir}Immcantation/8_PostIgBlastFilter/TRIBAL_tree/${file}/clonotypes.pkl" \
+  --n_isotypes 10 \
+  --mode refinement \
+  --cores 10 \
+  --transmat-infer "${LongRead_dir}Immcantation/8_PostIgBlastFilter/TRIBAL_tree/${file}/transmat.txt" \
+  --pickle "${LongRead_dir}Immcantation/8_PostIgBlastFilter/TRIBAL_tree/${file}/lineage_trees.pkl" \
+  --write-results "${LongRead_dir}Immcantation/8_PostIgBlastFilter/TRIBAL_tree/${file}/results" \
+  --score "${LongRead_dir}Immcantation/8_PostIgBlastFilter/TRIBAL_tree/${file}/objective.csv"
+
+
+done
+
+
+```
+
+
+
+## Final anonymized objects 
+
+### Clonotypes merged airr dataset with clone identifier - Anonymized
+
+```{r,eval=FALSE}
+
+SampleId <- Anonym_table$SpatialVDJ_id
+
+IDmatch <- Anonym_table$SpatialGEX_id
+names(IDmatch) <- SampleId
+
+Ano_corresp <- setNames(Anonym_table$Anonym_id,nm = Anonym_table$SpatialVDJ_id) # not shared
+
+airr_list <- list()
+
+for(file in FileID){
+    file_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass.tsv")
+    ## Load airr 
+    tmp <- read_rearrangement(file_path)
+    
+    ##### anonym id
+    ano_id <- Ano_corresp[[file]]
+
+    ## adapt sb to match Seurat combined object
+    tmp$sb <- paste(paste0(tmp$sb,"-1"),ano_id,sep = "_")
+    
+    ## Create a cell column by concatenating the SB and the clonotype_id
+    tmp$cell <- paste(tmp$sb,tmp$clonotype_id,sep = "-")
+    tmp$cell<-gsub("_","-",tmp$cell)
+    ## Add the string "Clone_" before the clone_id to match the required format of TRIBAL
+    tmp$clone_id <- paste0("Clone_",tmp$clone_id)
+    
+    # Add sampleid column with anonymized id
+    tmp$sampleid <- ano_id
+    
+    # store in list
+    airr_list[[file]]<-tmp
+}    
+
+airr<-Reduce(rbind,airr_list)
+
+# Write merged table
+write_rearrangement(airr,file=paste0(res_folder,"20260721_airr_igblast-db_igh_clonal_grouped_full_database.tsv"))   
+
+```
+
+
+### Clones table statistics - Anonymized
+
+```{r,eval=FALSE}
+SampleId <- Anonym_table$SpatialVDJ_id
+
+IDmatch <- Anonym_table$SpatialGEX_id
+names(IDmatch) <- SampleId
+
+Ano_corresp <- setNames(Anonym_table$Anonym_id,nm = Anonym_table$SpatialVDJ_id) # not shared
+
+isotype_palette <- c("IGHM"="#253494", "IGHD"="#1D91C0", "IGHG1"="#d62728", "IGHG2"="#ff7f0e",  "IGHG3"="#FF6EC7", "IGHG4"="#FCCF05", "IGHA1"="#2ca02c", "IGHA2"="#36e40a","IGHE"="#8c564b","IGH_NA"="grey")
+
+Order <- c("IGHM","IGHD","IGHG3","IGHG1","IGHA1","IGHG2","IGHG4","IGHE","IGHA2","IGH_NA")
+
+my_colors <- c("#66b803", "#f94144", "#f8961e", "#3574b8", "#DE77AE", "#9970AB", "#D5E4A2", "#71D0F5", "#B1746F", "#ADE2D0", "#20DE8BFF", "#CCDE8BFF", "#f7f31c", "#FFA88BFF", "#FF6A8BFF")
+
+bin<-"No_bin"# MetaTopic No_bin
+
+# Generate descriptive data.frame for each sample at clone level (Nb cell, Nb isotype, Meta topic distribution, isotype ratio, etc). And then merge in one full table for all sample
+list_file <- list()
+for(file in FileID){
+  #Load the Seurat object with the metadata containing the MetaTopic info
+  Seurat <- readRDS(paste0("PATH/",file,"_seurat_sct_BayesSpace_Starfysh_TLSsign_SpaTopic_CellTopic_",bin,"_MetaTopicMOVICS",".rds"))
+  SpotsMetaTopics <-Seurat$MetaTopic
+  ##Palette of MetaTopics
+  MetaTopPal <- my_colors[1:length(levels(Seurat$MetaTopic))]
+  names(MetaTopPal)<-levels(Seurat$MetaTopic)#unify the color of metatopic
+  
+   # PAth of the final IGH clone with germline reconstruct database
+    file_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass.tsv")
+    ## Load airr
+    airr <- read_rearrangement(file_path)
+    ## Create a cell column by concatenating the SB and the clonotype_id
+    airr$cell <- paste(airr$sb,airr$clonotype_id,sep = "-")
+    airr$cell<-gsub("_","-",airr$cell)
+    ## Add the string "Clone_" before the clone_id to match the required format of TRIBAL
+    airr$clone_id <- paste0("Clone_",airr$clone_id)
+    CloneID <- unique(airr$clone_id) # get unique id
+    
+    # Calculate combined R and S mutation frequencies/number for each clonotype
+    airr <- shazam::observedMutations(airr, sequenceColumn="sequence_alignment",
+                                germlineColumn="germline_alignment_d_mask",
+                                regionDefinition=NULL,
+                                frequency=TRUE, 
+                                combine=TRUE,
+                                nproc=6)
+    
+    airr <- shazam::observedMutations(airr, sequenceColumn="sequence_alignment",
+                                germlineColumn="germline_alignment_d_mask",
+                                regionDefinition=NULL,
+                                frequency=FALSE, 
+                                combine=TRUE,
+                                nproc=6)
+    
+    # recompute align seq (VDJ) length
+    airr$seq_aligned_length <-stri_count(airr[["sequence_alignment"]],regex="[^-.N]")
+    
+    ## Create a data frame containing the number of cell per IGH clone
+    df <- data.frame(sort(table(airr$clone_id),decreasing = T))
+    colnames(df)<-c("clone_id","Nb_cell")
+   
+    
+    ## Compute clone frequency in the tumor
+    df$Clone_frequency <- df$Nb_cell/sum(df$Nb_cell)
+    
+    ## Number of unique clonotype per clone
+    Uniq_clonotype_per_clone<-tapply(airr$clonotype_id, airr$clone_id, function(clonotype)length(unique(clonotype)))
+    df$Uniq_clonotype <-Uniq_clonotype_per_clone[as.character(df$clone_id)]
+    
+    ## NB of unique isotype per clone
+    ### correct if IGH_NA, then not an isotype :: count 0
+    Uniq_isotype_per_clone<-tapply(airr$isotype, airr$clone_id, function(iso){
+      iso<-iso[iso!="IGH_NA"] # remove IGH_NA
+      length(unique(iso))
+    })
+    df$Uniq_iso <-Uniq_isotype_per_clone[as.character(df$clone_id)]
+
+    
+    ## NB of unique isotype per clone
+    ### correct if IGH_NA, then not an isotype :: count 0
+    Uniq_isotype_per_clone<-tapply(airr$isotype, airr$clone_id, function(iso){
+      iso<-iso[iso!="IGH_NA"] # remove IGH_NA
+      length(unique(iso))
+    })
+    df$Uniq_iso <-Uniq_isotype_per_clone[as.character(df$clone_id)]
+
+    ## attribute mutational 
+    # If mutiple mutationnal freq per clonotype_id, then consider the one of the longest vdj alignment (the more accurate ...)
+    # For a clone id, count the max mu_freq of all its clonotype / average accross clonotypes
+    mutational_freq_cln<-tapply(airr[,c("clonotype_id","mu_freq","mu_count","seq_aligned_length")], airr$clone_id, function(mut_df){
+      #select only one value of mu_freq per clonotype
+      one_mu_freq_per_clono<-tapply(mut_df,mut_df$clonotype_id,function(clono_df){
+        unique_maxLen_mu<-unique(clono_df[clono_df$seq_aligned_length==max(clono_df$seq_aligned_length),]$mu_freq)
+        if(length(unique_maxLen_mu)==1){
+          return(unique_maxLen_mu)
+        }else{
+          warning("Multiple value of mu_freq for same seq len (max) in one clonotype - return mean")
+          return(mean(unique_maxLen_mu))
+        }
+      })
+      #select only one value of mu_count per clonotype
+      one_mu_count_per_clono<-tapply(mut_df,mut_df$clonotype_id,function(clono_df){
+        unique_maxLen_mu<-unique(clono_df[clono_df$seq_aligned_length==max(clono_df$seq_aligned_length),]$mu_count)
+        if(length(unique_maxLen_mu)==1){
+          return(unique_maxLen_mu)
+        }else{
+          warning("Multiple value of mu_freq for same seq len (max) in one clonotype - return mean")
+          return(mean(unique_maxLen_mu))
+        }
+      })
+      
+      
+      #return max and average
+      return(data.frame(max_mu_freq=max(one_mu_freq_per_clono),
+             mean_mu_freq=mean(one_mu_freq_per_clono),
+             max_mu_count=max(one_mu_count_per_clono),
+             mean_mu_count=mean(one_mu_count_per_clono)))
+    },simplify = T)
+    toname<-names(mutational_freq_cln)
+    mutational_freq_cln<-Reduce(rbind,mutational_freq_cln)
+    mutational_freq_cln$clone_id<-toname
+    
+    df<-merge(df,mutational_freq_cln,by="clone_id")
+    df<-df[order(df$Nb_cell,decreasing = T),]
+    
+    ## Get the correspondance between SB and MetaTopics 
+    MetaCorresp <- Seurat$MetaTopic
+     
+    # Apply for each clone, take the list of SB, and return a vector of length levels of Metatopics and count the number of each SB in each MetaTop
+    res <- sapply((setNames(levels(df$clone_id),levels(df$clone_id))),function(cln){
+      sb_cln <- airr[airr$clone_id %in% cln,]$sb
+      sb_cln<-paste0(sb_cln,"-1") # adapt to Visium format
+      #get meta in clone
+      meta_cln <- MetaCorresp[sb_cln]
+      table(meta_cln)
+    })
+    res<-(t(res))
+    res_prop <- res/rowSums(res)
+    res <- data.frame(res)
+    res$clone_id <- factor(rownames(res),levels = rownames(res))
+    res_prop <- data.frame(res_prop)
+    res_prop$clone_id <- factor(rownames(res_prop),levels = rownames(res_prop))
+    
+    ### Merge res_prop with original df to aggregate multiple variable per clone 
+    df <- merge(df,res_prop,by="clone_id")
+    df <- df[order(df$Nb_cell,decreasing = T),]
+    
+    #melt res_prop and res
+    df_count <- reshape::melt(res,id.vars=c("clone_id"))
+    df_prop <- reshape::melt(res_prop,id.vars=c("clone_id"))
+    
+    # Script provided but not included in final article : plot == distribution of Meta Topic for each clone ordered by Nb of Cell in clone (decreasing)
+    # p1 <-ggplot(df_count) +
+    #     geom_bar(stat = 'identity', position = 'stack',aes(x = clone_id, y = value,fill=variable))+
+    #     theme_bw()+
+    #     labs(y="SB count in IGH clone",
+    #          x=NULL,
+    #          fill="MetaTopics")+
+    #     theme(axis.text.x = element_blank())+
+    #     scale_fill_manual(values = MetaTopPal)
+    # p2 <-ggplot(df_prop) +
+    #     geom_bar(stat = 'identity', position = 'stack',aes(x = clone_id, y = value,fill=variable))+
+    #     theme_bw()+
+    #     labs(y="SB proportion in IGH clone",
+    #          x="Unique IGH clone",
+    #          fill="MetaTopics")+
+    #     theme(axis.text.x = element_blank())+
+    #     scale_fill_manual(values = MetaTopPal)
+    # 
+    # patch<-(p1/p2)+plot_layout(guides = 'collect') + plot_annotation(title = file)
+    # ggsave(plot = patch,
+    #          filename =  paste0(res_folder,file,"_StackBarplot_MetaTopicMOVICS_noBin_IGH_clone_expansion_AllClones",".pdf"),
+    #          width = 10,height = 5)
+    # 
+  
+    ###############################
+    # Same but now count each IGH isotypes rather than MetaTopics
+    # Apply for each clone, take the list of SB, and return a vector of length levels of Metatopics and count the number of each SB in each MetaTop
+    res <- table(airr$clone_id,airr$isotype)
+    res_prop <- res/rowSums(res)
+    res <- data.frame(res)
+    colnames(res)<-c("clone_id","variable","value")
+    res$clone_id <- factor(as.character(res$clone_id),levels = levels(df$clone_id))
+    res$variable <- factor(as.character(res$variable),levels = Order)
+    
+    res_prop <- data.frame(res_prop)
+    colnames(res_prop)<-c("clone_id","variable","value")
+    res_prop$clone_id <- factor(as.character(res_prop$clone_id),levels = levels(df$clone_id))
+    res_prop$variable <- factor(as.character(res_prop$variable),levels = Order)
+    
+    ##### wider res_prop to aggregate with previous df 
+    res_prop_wid <- pivot_wider(res_prop,names_from = "variable",values_from = "value")
+    res_prop_wid<-as.data.frame(res_prop_wid)
+    df <- merge(df,res_prop_wid,by="clone_id")
+    df<-df[order(df$Nb_cell,decreasing = T),]
+    
+    # res_prop and res
+    df_count <- res
+    df_prop <- res_prop
+    
+    # similarly , this script is provided but not included : distribution of isotype / clone
+    # p1 <-ggplot(df_count) +
+    #     geom_bar(stat = 'identity', position = 'stack',aes(x = clone_id, y = value,fill=variable))+
+    #     theme_bw()+
+    #     labs(y="Isotype count in IGH clone",
+    #          x=NULL,
+    #          fill="Isotype")+
+    #     theme(axis.text.x = element_blank())+
+    #     scale_fill_manual(values = isotype_palette)
+    # p2 <-ggplot(df_prop) +
+    #     geom_bar(stat = 'identity', position = 'stack',aes(x = clone_id, y = value,fill=variable))+
+    #     theme_bw()+
+    #     labs(y="Isotype proportion in IGH clone",
+    #          x="Unique IGH clone",
+    #          fill="Isotype")+
+    #     theme(axis.text.x = element_blank())+
+    #     scale_fill_manual(values = isotype_palette)
+    # 
+    # patch<-(p1/p2)+plot_layout(guides = 'collect') + plot_annotation(title = file)
+    # ggsave(plot = patch,
+    #          filename =  paste0(res_folder,file,"_StackBarplot_Isotypes_IGH_clone_expansion_AllClones",".pdf"),
+    #          width = 10,height = 5)
+    # 
+ 
+    ## Export df for each sample to create a merged plot
+     ##### anonym id
+    ano_id <- Ano_corresp[[file]]
+    df$sampleid<-ano_id
+    list_file[[file]] <-df
+}  
+
+# merge all df
+## add IGH_NA and IGHE column for each and fill with 0
+list_file <- lapply(list_file,function(table){
+  if(!("IGHE" %in% colnames(table))){
+    table$IGHE <- 0
+  }
+  if(!("IGH_NA" %in% colnames(table))){
+    table$IGH_NA <- 0
+  }
+  table
+})
+
+# reorder col and merge
+colOrder<-colnames(list_file[[1]])
+list_file<-lapply(list_file,function(table)table[,colOrder])
+
+# Create a merged plot
+list_file<-lapply(list_file,function(table)table[order(table$Nb_cell),])
+Merged_df <- Reduce(rbind,list_file)
+
+## count number of uniq metatopic per clone/ presence in MetaTopic M3 (TLS)
+Merged_df$Uniq_metaTop <-rowSums(Merged_df[,c("M1",  "M2",  "M3", "M4",  "M5",  "M6", "M7" )]!=0)
+Merged_df$M3_metaTop_pos <-ifelse(Merged_df[,c("M3")]!=0,yes = "M3_pos",no = "M3_neg")
+Merged_df$M3_metaTop_pos<-factor(Merged_df$M3_metaTop_pos,levels = c("M3_neg","M3_pos"))
+
+# correct NB iso ; if 0, then only "isotype" is IGH_NA, then count 1 (because there is at least 1 isotype ...). But do not consider IGH_NA as an added isotype (not included for CSR) if there are other
+Merged_df$Uniq_iso[Merged_df$Uniq_iso==0]<-1
+
+## Reorganize column to have first sampleid, clone_id, etc
+Merged_df <- Merged_df[,c("sampleid",setdiff(colnames(Merged_df),"sampleid"))]
+
+write.csv(Merged_df,file = paste0(res_folder,"20260722_SpatialVDJ_CloneStatistics_reproduce_Figure3.csv"),row.names = F)
+```
+
+
+# Reload merged dataset
+
+Reload data
+
+```{r}
+# Seurat
+Srt_combined <- readRDS(paste0("PATH/Figure2_S6_S7/","20260721_Seurat_merged_SpatialGEX_annotated_metadata.rds")) # Seurat object generated in previous script
+
+
+# ORder IGH iso
+Order <- c("IGHM","IGHD","IGHG3","IGHG1","IGHA1","IGHG2","IGHG4","IGHE","IGHA2","IGH_NA")
+
+
+# airr dataset for SpatialVDJ containing clone identifier. Dataset merged for all samples (and anonymized)
+airr_merged <- read_rearrangement(paste0(res_folder,"20260721_airr_igblast-db_igh_clonal_grouped_full_database.tsv"))
+## Level isotypes
+airr_merged$isotype <- factor(airr_merged$isotype,levels = c(Order,setdiff(unique(airr_merged$isotype),Order)))
+## level sample id
+airr_merged$sampleid<-factor(airr_merged$sampleid,levels = Anonym_table$Anonym_id)  
+
+
+# Clone_Merged_df is the clones level statistics
+Clone_Merged_df <- read.csv(paste0(res_folder,"20260722_SpatialVDJ_CloneStatistics_reproduce_Figure3.csv"))
+
+
+```
+
+
+# Figures
+
+## Figure 3A - Experimental scheme (biorender)
+
+**Figure 3A compressed** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure3A_to_render_compressed.pdf"),density = 300)
+plot(img)
+```
+
+## Figure 3B - Clonotype distribution for one selected clone
+
+```{r}
+isotype_palette <- c("IGHM"="#253494", "IGHD"="#1D91C0", "IGHG1"="#d62728", "IGHG2"="#ff7f0e",  "IGHG3"="#FF6EC7", "IGHG4"="#FCCF05", "IGHA1"="#2ca02c", "IGHA2"="#36e40a","IGHE"="#8c564b","IGH_NA"="grey")
+
+Order <- c("IGHM","IGHD","IGHG3","IGHG1","IGHA1","IGHG2","IGHG4","IGHE","IGHA2","IGH_NA")
+
+my_colors <- c("#66b803", "#f94144", "#f8961e", "#3574b8", "#DE77AE", "#9970AB", "#D5E4A2", "#71D0F5", "#B1746F", "#ADE2D0", "#20DE8BFF", "#CCDE8BFF", "#f7f31c", "#FFA88BFF", "#FF6A8BFF")
+
+# bin<-"No_bin" # from previous optimization ...
+
+# Following script initially supposed to loop on all file and all clone but here it will be used only to reproduce the Main Figure 3B (tumor SP_LHD6US and clone == 490)
+
+file<-"SP_LHD6US"
+# for(file in Anonym_table$Anonym_id){
+  #Airr path and load airr
+  # PAth of the final IGH clone with germline reconstruct database
+  # file_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass.tsv")
+  # ## Load airr 
+  # airr <- read_rearrangement(file_path)
+  
+  airr <- airr_merged[airr_merged$sampleid %in% file,] # get back the sample level table by subsetting on anonymized sample id
+  
+  CloneID <- unique(airr$clone_id) # get unique id
+  
+  # Number of cell per clone_id
+  SortCln<-sort(table(airr$clone_id),decreasing = T)
+  
+  #Load the Seurat object with the metadata containing the MetaTopic info
+  # Seurat <- readRDS(paste0("PATH/",file,"_seurat_sct_BayesSpace_Starfysh_TLSsign_SpaTopic_CellTopic_",bin,"_MetaTopicMOVICS",".rds"))
+  Seurat <-  suppressWarnings(subset(Srt_combined,subset = file_id == file)) # retrieve the sample level seurat by subsetting with anonymized id metadata
+  Seurat@images <- Seurat@images[file] # remvove all other images
+  SpotsMetaTopics <-Seurat$MetaClusters
+  ##Palette of MetaTopics
+  MetaTopPal <- my_colors[1:length(levels(Seurat$MetaClusters))]
+  names(MetaTopPal)<-levels(Seurat$MetaClusters)#unify the color of metatopic
+  
+  ggplot_list<-list()
+  
+  #iterate on each clone ID
+  #### adapt to only run relevent clone
+  id<-"Clone_490"
+  # for(id in names(head(SortCln,n=100))){
+    ## get the information on clonotype for the corresponding clone
+    airr_sub_clone<-data.frame(airr[airr$clone_id %in% id,])
+    rownames(airr_sub_clone)<-airr_sub_clone$cell #names according to cell unique id
+    
+    #number of sequences/cells
+    n<-nrow(airr_sub_clone)
+    #########  Plot as in Meylan et al : spatial pie plot
+    CellID_list <- unique(airr_sub_clone$clonotype_id) #get the list of cell Id from one clonal family
+  
+    #Concatenate all Cell id within one spot - Generate a spot data.frame
+    ClonalFamily<-tapply(airr_sub_clone$clonotype_id,airr_sub_clone$sb,paste,collapse=",")
+    # names(ClonalFamily)<-paste0(names(ClonalFamily),"-1")
+    ClonalFamily<-as.data.frame(ClonalFamily)
+
+    colnames(ClonalFamily) <- id
+    
+    Seurat_Cln <- AddMetaData(object= Seurat,
+                          metadata = ClonalFamily)
+    SeuratSub <- AddMetaData(Seurat_Cln,!is.na(Seurat_Cln@meta.data[,id]),col.name="Sub")
+    SeuratSub <- suppressWarnings(subset(SeuratSub,subset = Sub == "TRUE"))
+    
+    #Change colors according to previous plot
+    ##Get the color of the ggplot (stack overflow :https://stackoverflow.com/questions/8197559/emulate-ggplot2-default-color-palette)
+    gg_color_hue <- function(n) {
+      hues = seq(15, 375, length = n + 1)
+      hcl(h = hues, l = 65, c = 100)[1:n]
+    }
+    
+    CheckPlot <- SpatialDimPlot(SeuratSub, group.by = id,crop = F,pt.size.factor = 1.5,image.alpha = 0.5)+theme(plot.margin = margin(0, 0, 0, 0, "cm"),legend.key.size = unit(0.4, 'cm'),legend.direction = "vertical",legend.title = element_text(size = 9),legend.text = element_text(size = 8))
+    
+    
+    #### Reproduce plot from MaxMey Immunity 
+    TissueCoordinates <- GetTissueCoordinates(object = Seurat_Cln)
+     #transform 
+              y <- TissueCoordinates$imagerow
+              y_mid <- min(y)+0.5*(max(y)-min(y))
+              coords_y <- y-y_mid # centre sur le milieu
+              coords_y<- -coords_y # on inverse tout
+              coords_y <- coords_y+y_mid #on repasse sur une echelle 
+              TissueCoordinates$imagerow <-coords_y 
+    
+    #Create a matrix of spot X clonotype (unique clonotype) 
+    scatter_df <-table(airr_sub_clone$sb,airr_sub_clone$clonotype_id)
+    # rownames(scatter_df)<-paste0(rownames(scatter_df),"-1")
+    scatter_df<-data.frame(pivot_wider(data.frame(scatter_df),names_from = "Var2",values_from = "Freq"))
+    rownames(scatter_df)<-scatter_df$Var1
+    scatter_df<-(scatter_df[,setdiff(colnames(scatter_df),"Var1"),drop=F])
+    
+     ## If there is only 1 clonotype within the clone (multiple cell accross the slide) : Add a "Unselected" column to scatter_df or it won't work with geom_scatterpie...
+    if(ncol(scatter_df)==1){
+      scatter_df$Unselected <- 0
+    }
+    
+    #Combine coordinates, in the right order, and clonotypes count in each spot
+    scatter_df <- cbind(TissueCoordinates[rownames(scatter_df),],scatter_df)
+    scatter_df$region <- factor(1:nrow(scatter_df))
+    
+    transparent_col <- "#00000000"
+    #list of metadata to highlight with corresponding barcodes
+   ## Create a dummy list with names being the clonotypes and content being one valid barcode in the dataset but no matter which one 
+    ##### In case the barcode for which multiple clonotypes are foudn (ie 1 spot with mutiple clonotypes), It leads to issue in the label. Knowing to_select is just used to create a good labeling, I modify to_select so that there is no overlapping barcode ... 
+
+    to_select <- lapply(1:length(CellID_list),function(j){
+      colnames(Seurat)[j]
+    })
+    names(to_select)<-CellID_list
+    
+    p <- SpatialPlot(Seurat_Cln,
+                     image.alpha = 1,
+                     pt.size.factor =0,
+                     alpha=1,
+                     cells.highlight = to_select,
+                     label.size = 3,
+                     cols.highlight = c(rainbow(length(to_select)),transparent_col))
+    p <- p  + geom_scatterpie_edit(data=scatter_df, aes(y=imagerow, x=imagecol,group=region),
+                              #pie_scale = 0.8, # to increase or decrease the spot size
+                              cols=colnames(scatter_df[,3:(ncol(scatter_df)-1)]))
+    p <- p + ggtitle(paste0(id))+labs(fill="Clonotypes")
+
+    ### THIS IS MAIN PLOT 3B
+    ggsave(plot = p,
+           filename = paste0(res_folder,"Figure3B_",file,"_",id,"_Spatial_PiePlot_clonotypes_n",n,"cells",".pdf"),
+           width = 6,height = 4)
+    
+ # } # loop clone
+#} # loop file  
+```
+
+
+**Figure 3B** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure3B_SP_LHD6US_Clone_490_Spatial_PiePlot_clonotypes_n54cells.pdf"),density = 300)
+plot(img)
+```
+
+
+## Figure 3C - Clonal expansion in all SpatialVDJ
+
+Count the number of cells (combination of a unique clonotype in a unique SB) per IGH clone as well as the number of cells per isotype per IGH clones. 
+Represent as a stack barplot for number and proportion. 
+And add a tag information for TLS positivity.
+
+```{r}
+## Expansion basic plot
+Merged_df_melt<-Clone_Merged_df[,c("sampleid","clone_id","Nb_cell")]
+Merged_df_melt <- reshape::melt.data.frame(Merged_df_melt,id.vars = c("sampleid","clone_id"))
+
+# Merged_df_melt$sampleid<- factor(Merged_df_melt$sampleid,levels = Anonym_table$Anonym_id)
+Merged_df_melt$sampleid<- factor(Merged_df_melt$sampleid,levels = c( "SP_LHD6US",
+                                                                     "SP_0V2O6G",
+                                                                     "SP_0O0B5S",
+                                                                     "SP_R9MS02")) # specify directly level to get same order as initially ...
+
+
+plot<-ggplot(Merged_df_melt,aes(x=sampleid,y=value,fill=value))+
+  geom_bar(position="stack", stat="identity",color="black",linewidth = 0.02)+
+  scale_fill_viridis_c(trans = "log", direction = +1,labels = prettyNum,breaks=base_breaksLog10())+
+  theme_bw()+
+  labs(x=NULL,
+       y="Number of cell (unique clonotype/spot)",
+       title = "Clonal expansion as number of cells in IGH clone",
+       fill="Cell/clone")
+
+ggsave(plot = plot,
+             filename =  paste0(res_folder,"Figure3C_Barplot_ClonalExpansion_CellNumber_In_IGHclone",".pdf"),
+             width = 8,height = 6)
+```
+
+**Figure 3C** 
+```{r,fig.height=8,fig.width=8}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure3C_Barplot_ClonalExpansion_CellNumber_In_IGHclone.pdf"),density = 300)
+plot(img)
+```
+
+
+
+## Figure 3D - Experimental scheme (biorender)
+
+**Figure 3D compressed** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure3D_to_render_compressed.pdf"),density = 300)
+plot(img)
+```
+
+
+## Figure 3E, 3F, 3G - Clonal expansion SHM, CSR vs TLS cluster
+
+```{r}
+## Clone present in TLS at least one time vs other
+p1<-ggplot(Clone_Merged_df,aes(x=M3_metaTop_pos,y=Clone_frequency))+
+  geom_violin(aes(fill=M3_metaTop_pos),trim = T)+
+  geom_boxplot(color="black",fill="white",width=0.1)+
+  geom_jitter(size=0.5)+
+  # scale_color_manual(values = c("M3_pos"="#f8961e","M3_neg"="black"))+
+  scale_y_continuous(trans = "log10",labels = prettyNum,breaks = base_breaksLog10())+
+  #scale_fill_viridis_c()+
+  theme_bw()+
+  theme(legend.position = "none")+
+  labs(x=NULL,
+       y="IGH clone frequency\n(IGH unique cells in clone/total IGH cell)",
+       title = "Clonal expansion")+
+  stat_compare_means()
+
+p2<-ggplot(Clone_Merged_df,aes(x=M3_metaTop_pos,y=mean_mu_freq))+
+  geom_violin(aes(fill=M3_metaTop_pos),trim = T)+
+  geom_boxplot(color="black",fill="white",width=0.1)+
+  # geom_jitter()+
+  # scale_color_manual(values = c("M3_pos"="#f8961e","M3_neg"="black"))+
+  # scale_y_continuous(trans = "log10",labels = prettyNum,breaks = base_breaksLog10())+
+  #scale_fill_viridis_c()+
+  theme_bw()+
+  theme(legend.position = "none")+
+  labs(x=NULL,
+       y="IGH clone mean mutational frequency",
+       title = "SHM")+
+  stat_compare_means()
+
+
+Clone_Merged_df$CSR<-ifelse(Clone_Merged_df$Uniq_iso>1,yes = "> 1 isotype",no = "only 1 isotype")
+Clone_Merged_df$CSR <- factor(Clone_Merged_df$CSR,levels = c("only 1 isotype","> 1 isotype"))
+
+p3<-plot_contingency(Clone_Merged_df,
+                     variables = c("CSR","M3_metaTop_pos"),
+                     create_labels = F,
+                     test_name = "fisher.test",
+                     title = "CSR")
+p3<-p3[[1]]
+
+tabl_M3_IGH<-table(Clone_Merged_df$M3_metaTop_pos)
+
+patch<-((p1|p2|p3))+plot_annotation(title = "IGH clones with at least one cell in TLS (MetaTopic M3) : TLS-positive (M3_pos)",
+                                    subtitle = paste(paste("Number of IGH clones: ",names(tabl_M3_IGH),tabl_M3_IGH,sep = "=",collapse = ";")))
+
+
+ggsave(plot = patch,
+             filename =  paste0(res_folder,"Figure3EFG_MetaTopic_violin_ClonalExpansion_and_mutation_and_CSR_inTLS",".pdf"),
+             width = 10,height = 5)
+
+```
+
+**Figure 3E, 3F, 3G** 
+```{r,fig.height=7,fig.width=10}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure3EFG_MetaTopic_violin_ClonalExpansion_and_mutation_and_CSR_inTLS.pdf"),density = 300)
+plot(img)
+```
+
+
+
+## Figure S8A - Experimental scheme (biorender)
+
+**Figure S8A compressed** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S8A_to_render_compressed.pdf"),density = 300)
+plot(img)
+```
+
+
+## Figure S8B and S8C - IGH clonotype forms (BCR or antibody)
+
+
+```{r}
+SampleId <- Anonym_table$SpatialVDJ_id
+
+IDmatch <- Anonym_table$SpatialGEX_id
+names(IDmatch) <- SampleId
+
+IDmatchAnonym <- Anonym_table$Anonym_id
+names(IDmatchAnonym) <- SampleId
+
+# this was the initial script / here airr will be obtained from the merged clonotypes table shared
+# airr<-list()
+# 
+# for(file in FileID){
+#   
+#   print(file)
+#   
+#   # Do not need to adapt from here - path of Igblast quality filtered database
+#   file_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI.tsv")
+#   
+#   # Load airr 
+#   tmp<-read_rearrangement(file_path)
+#   tmp$sampleid<-file
+#   airr[[file]] <- tmp
+#   
+# }  
+# airr<-Reduce(rbind,airr)
+# airr$sampleid <- setNames(IDmatchAnonym[airr$sampleid],NULL)
+# airr$sampleid<-factor(airr$sampleid,levels = Anonym_table$Anonym_id)
+
+
+airr <- airr_merged
+
+###### ###### ###### ###### ###### ###### ###### ###### ###### ###### ###### ###### ###### ###### 
+###### Number & proportion of unique clonotype in each isotype / form
+###### ###### ###### ###### ###### ###### ###### ###### ###### ###### ###### ###### ###### ###### 
+
+## Form proportion for each isotype (only for IGH) - per patient
+#### Simplify form by grouping ambiguous and incomplete in ambiguous
+airr$c_imgtref_form <- ifelse(airr$c_imgtref_form %in% c("Incomplete","Form_NA"),
+                              yes = "Ambiguous" ,
+                              no = airr$c_imgtref_form) # simplify form
+
+Sub <- tapply(airr$clonotype_id,airr[,c("c_imgtref_form","isotype","sampleid")],function(x)length(unique(x)))
+Sub <- apply(Sub,3,function(matrix){
+    tmp<-data.frame(matrix)
+    tmp[is.na(tmp)] <- 0 # if count is NA it means 0 counts in this case... (for IGHE)
+    tmp
+})
+Sub <- lapply(names(Sub),function(id){
+  tmp<-Sub[[id]]
+  tmp$c_imgtref_form <- rownames(tmp)
+  rownames(tmp)<-NULL
+  tmp$sampleid<-id
+  tmp
+})
+Sub <- Reduce(rbind,Sub)
+Sub <- reshape::melt.data.frame(Sub,id.vars = c("sampleid","c_imgtref_form"))
+# Sub$sampleid <- factor(Sub$sampleid,levels =Anonym_table$Anonym_id )
+Sub$sampleid <- factor(Sub$sampleid,levels =c( "SP_LHD6US",
+                                               "SP_0V2O6G",
+                                               "SP_0O0B5S",
+                                               "SP_R9MS02") ) # specify directly level to get same order as initially ...
+Sub <- Sub[grepl("IGH",Sub$variable),]#remove all non IGH
+Order <- c("IGHM","IGHD","IGHG3","IGHG1","IGHA1","IGHG2","IGHG4","IGHE","IGHA2","IGH_NA")# sort according to order of IGH on the genome
+Sub$variable <- factor(as.character(Sub$variable),levels = Order)
+      pal <- c("IGHM"="#253494", "IGHD"="#1D91C0", "IGHG1"="#d62728", "IGHG2"="#ff7f0e",  "IGHG3"="#FF6EC7", "IGHG4"="#FCCF05", "IGHA1"="#2ca02c", "IGHA2"="#36e40a","IGHE"="#8c564b","IGH_NA"="grey")
+
+Sub$c_imgtref_form<- factor(Sub$c_imgtref_form,levels = c("Secreted","Membrane","Ambiguous"))
+
+Sub <- pivot_wider(Sub,names_from = c_imgtref_form,values_from = value,id_cols = c("sampleid","variable")) 
+
+
+## PLot number of unique clonotype in membrane form for each isotype
+PlotMembrane <- ggplot(Sub,aes(x=variable,y=Membrane))+
+  geom_boxplot(fill="red")+
+  geom_point()+
+  geom_line(aes(group=sampleid,color=sampleid))+
+  theme_bw()+
+  labs(x=NULL,
+       y="Membrane form count")
+
+## Convert in numeric according to order of factor for the scatterpie function
+Sub$sampleid <-as.numeric(Sub$sampleid)
+Sub$variable <-as.numeric(Sub$variable)
+
+PlotScatter<-ggplot(Sub,aes(y=sampleid, x=variable))+
+  scatterpie::geom_scatterpie(data = Sub,mapping = aes(y=sampleid, x=variable),cols=c("Secreted","Membrane","Ambiguous"),
+                  pie_scale = 2)+ # to increase or decrease the spot size)
+  #scale_y_continuous(trans = "log10",breaks = base_breaksLog10(),labels = prettyNum)+
+  theme_bw()+
+  scale_fill_manual(values = c(Ambiguous="grey",Secreted="#A6CEE3",Membrane="red"))+
+  scale_x_continuous(breaks=seq(1,length(Order),1),labels=Order)+
+  # scale_y_continuous(breaks=seq(1,length(Anonym_table$Anonym_id),1),labels=Anonym_table$Anonym_id)+
+  scale_y_continuous(breaks=seq(1,length(Anonym_table$Anonym_id),1),labels=c( "SP_LHD6US",
+                                               "SP_0V2O6G",
+                                               "SP_0O0B5S",
+                                               "SP_R9MS02"))+
+  labs(x=NULL,
+       y="Sample id",
+       fill="IGH form")
+
+Patch<-(PlotScatter/PlotMembrane)+plot_layout(heights = c(2,1))
+
+ggsave(plot = Patch,
+       filename = paste0(res_folder,"S8BC_IGH_Isotype_scatterPlot_and_Count_MembraneSecretedForm.pdf"),
+       width = 8,
+       height = 5)
+
+
+```
+
+
+
+**Figure S8B and S8C** 
+```{r,fig.height=7,fig.width=10}
+img <- magick::image_read_pdf(paste0(res_folder,"S8BC_IGH_Isotype_scatterPlot_and_Count_MembraneSecretedForm.pdf"),density = 300)
+plot(img)
+```
+
+
+## Figure 3H and S8D - Spatial plot with meta topic and clone distribution
+
+Plot each IGH clone in spatial plot with MetaTopic in background
+
+```{r}
+isotype_palette <- c("IGHM"="#253494", "IGHD"="#1D91C0", "IGHG1"="#d62728", "IGHG2"="#ff7f0e",  "IGHG3"="#FF6EC7", "IGHG4"="#FCCF05", "IGHA1"="#2ca02c", "IGHA2"="#36e40a","IGHE"="#8c564b","IGH_NA"="grey")
+
+Order <- c("IGHM","IGHD","IGHG3","IGHG1","IGHA1","IGHG2","IGHG4","IGHE","IGHA2","IGH_NA")
+
+my_colors <- c("#66b803", "#f94144", "#f8961e", "#3574b8", "#DE77AE", "#9970AB", "#D5E4A2", "#71D0F5", "#B1746F", "#ADE2D0", "#20DE8BFF", "#CCDE8BFF", "#f7f31c", "#FFA88BFF", "#FF6A8BFF")
+
+# bin<-"No_bin" # from previous optimization ...
+
+# Following script initially supposed to loop on all file and all clone but here it will be used only to reproduce :
+### The Main Figure 3H (tumor SP_LHD6US and clone == 370)
+### The Supplementary Figure S8D (tumor SP_R9MS02 and clone == 9)
+
+for(file in c("SP_LHD6US","SP_R9MS02")){
+  #Airr path and load airr
+  # PAth of the final IGH clone with germline reconstruct database
+  # file_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass.tsv")
+  # ## Load airr 
+  # airr <- read_rearrangement(file_path)
+  
+  airr <- airr_merged[airr_merged$sampleid %in% file,] # get back the sample level table by subsetting on anonymized sample id
+  
+  CloneID <- unique(airr$clone_id) # get unique id
+  
+  # Number of cell per clone_id
+  SortCln<-sort(table(airr$clone_id),decreasing = T)
+  
+  #Load the Seurat object with the metadata containing the MetaTopic info
+  # Seurat <- readRDS(paste0("PATH/",file,"_seurat_sct_BayesSpace_Starfysh_TLSsign_SpaTopic_CellTopic_",bin,"_MetaTopicMOVICS",".rds"))
+  Seurat <-  suppressWarnings(subset(Srt_combined,subset = file_id == file)) # retrieve the sample level seurat by subsetting with anonymized id metadata
+  Seurat@images <- Seurat@images[file] # remvove all other images
+  SpotsMetaTopics <-Seurat$MetaClusters
+  ##Palette of MetaTopics
+  MetaTopPal <- my_colors[1:length(levels(Seurat$MetaClusters))]
+  names(MetaTopPal)<-levels(Seurat$MetaClusters)#unify the color of metatopic
+  
+  ggplot_list<-list()
+  #iterate on each clone ID
+  #### here adapted to run only on selected clone
+  
+  id <- ifelse(file=="SP_LHD6US",yes = "Clone_370",no = "Clone_9") # Clone370 for SP_LHD6US / Clone_9 for SP_R9MS02
+  
+  # for(id in names(head(SortCln,n=100))){
+    ## get the information on clonotype for the corresponding clone
+    airr_sub_clone<-data.frame(airr[airr$clone_id %in% id,])
+    rownames(airr_sub_clone)<-airr_sub_clone$cell #names according to cell unique id
+    
+    #number of sequences/cells
+    n<-nrow(airr_sub_clone)
+    #########  Plot as in Meylan et al : spatial pie plot
+    CellID_list <- unique(airr_sub_clone$clonotype_id) #get the list of cell Id from one clonal family
+  
+    #Concatenate all Cell id within one spot - Generate a spot data.frame
+    ClonalFamily<-tapply(airr_sub_clone$clonotype_id,airr_sub_clone$sb,paste,collapse=",")
+    # names(ClonalFamily)<-paste0(names(ClonalFamily),"-1")
+    ClonalFamily<-as.data.frame(ClonalFamily)
+
+    colnames(ClonalFamily) <- id
+    
+    Seurat_Cln <- AddMetaData(object= Seurat,
+                          metadata = ClonalFamily)
+    SeuratSub <- AddMetaData(Seurat_Cln,!is.na(Seurat_Cln@meta.data[,id]),col.name="Sub")
+    SeuratSub <- suppressWarnings(subset(SeuratSub,subset = Sub == "TRUE"))
+    
+    #Change colors according to previous plot
+    ##Get the color of the ggplot (stack overflow :https://stackoverflow.com/questions/8197559/emulate-ggplot2-default-color-palette)
+    gg_color_hue <- function(n) {
+      hues = seq(15, 375, length = n + 1)
+      hcl(h = hues, l = 65, c = 100)[1:n]
+    }
+    
+    CheckPlot <- SpatialDimPlot(SeuratSub, group.by = id,crop = F,pt.size.factor = 1.5,image.alpha = 0.5)+theme(plot.margin = margin(0, 0, 0, 0, "cm"),legend.key.size = unit(0.4, 'cm'),legend.direction = "vertical",legend.title = element_text(size = 9),legend.text = element_text(size = 8))
+
+    
+    #### Reproduce plot from MaxMey Immunity 
+    TissueCoordinates <- GetTissueCoordinates(object = Seurat_Cln)
+     #transform 
+              y <- TissueCoordinates$imagerow
+              y_mid <- min(y)+0.5*(max(y)-min(y))
+              coords_y <- y-y_mid # centre sur le milieu
+              coords_y<- -coords_y # on inverse tout
+              coords_y <- coords_y+y_mid #on repasse sur une echelle 
+              TissueCoordinates$imagerow <-coords_y 
+    
+    #Create a matrix of spot X clonotype (unique clonotype) 
+    scatter_df <-table(airr_sub_clone$sb,airr_sub_clone$clonotype_id)
+    # rownames(scatter_df)<-paste0(rownames(scatter_df),"-1")
+    scatter_df<-data.frame(pivot_wider(data.frame(scatter_df),names_from = "Var2",values_from = "Freq"))
+    rownames(scatter_df)<-scatter_df$Var1
+    scatter_df<-(scatter_df[,setdiff(colnames(scatter_df),"Var1"),drop=F])
+    
+     ## If there is only 1 clonotype within the clone (multiple cell accross the slide) : Add a "Unselected" column to scatter_df or it won't work with geom_scatterpie...
+    if(ncol(scatter_df)==1){
+      scatter_df$Unselected <- 0
+    }
+    
+    #Combine coordinates, in the right order, and clonotypes count in each spot
+    scatter_df <- cbind(TissueCoordinates[rownames(scatter_df),],scatter_df)
+    scatter_df$region <- factor(1:nrow(scatter_df))
+    
+    transparent_col <- "#00000000"
+    #list of metadata to highlight with corresponding barcodes
+   ## Create a dummy list with names being the clonotypes and content being one valid barcode in the dataset but no matter which one 
+    ##### In case the barcode for which multiple clonotypes are foudn (ie 1 spot with mutiple clonotypes), It leads to issue in the label. Knowing to_select is just used to create a good labeling, I modify to_select so that there is no overlapping barcode ... 
+
+    to_select <- lapply(1:length(CellID_list),function(j){
+      colnames(Seurat)[j]
+    })
+    names(to_select)<-CellID_list
+    
+    p <- SpatialPlot(Seurat_Cln,
+                     image.alpha = 1,
+                     pt.size.factor =0,
+                     alpha=1,
+                     cells.highlight = to_select,
+                     label.size = 3,
+                     cols.highlight = c(rainbow(length(to_select)),transparent_col))
+    p <- p  + geom_scatterpie_edit(data=scatter_df, aes(y=imagerow, x=imagecol,group=region),
+                              #pie_scale = 0.8, # to increase or decrease the spot size
+                              cols=colnames(scatter_df[,3:(ncol(scatter_df)-1)]))
+    p <- p + ggtitle(paste0(id))+labs(fill="Clonotypes")
+
+
+    # Plot Isotypes
+    
+    CorrespIso <- airr[airr$clonotype_id  %in% CellID_list,c("clonotype_id","isotype")] # Get isotypes
+    CorrespIso <- CorrespIso[!duplicated(CorrespIso$clonotype_id),] # remove duplicated cells
+    
+    # isotype as character otherwise it do not work properly
+    CorrespIso$isotype <- as.character(CorrespIso$isotype)
+    
+    ## apply per isotype, retrieve all clonotypes for corresponding isotypes :
+    ### if the clonotypes is/are in the spot, then 1 for the isotype / else 0
+    scatter_iso<-tapply(CorrespIso$clonotype_id,CorrespIso$isotype,function(Clonotypes){
+              tmp<-scatter_df[,Clonotypes,drop=F]
+              tmp<-rowSums(tmp)
+              bc<-names(tmp)
+              setNames(as.numeric(tmp>0),nm = bc)
+          },simplify = F)
+    IsoColNames <- names(scatter_iso)
+    scatter_iso <- data.frame(Reduce(cbind,scatter_iso)) #data.frame in case there is only 1 iso, else it does nothing
+    colnames(scatter_iso)<-IsoColNames
+    
+    #First try
+    ## If there is only 1 isotype : Add a "Unselected" column to scatter_iso or it won't work with geom_scatterpie...
+    if(ncol(scatter_iso)==1){
+      scatter_iso$Unselected <- 0
+    }
+    
+    scatter_iso <- cbind(scatter_df[,c("imagerow","imagecol","region")],scatter_iso[rownames(scatter_df),])
+    
+    # change the levels of MetaTopic
+    Seurat_Cln$MetaClusters<-factor(Seurat_Cln$MetaClusters,levels = c(levels(Seurat_Cln$MetaClusters),names(isotype_palette)))
+    
+    p <- SpatialPlot(Seurat_Cln,
+                     image.alpha = 0,
+                     pt.size.factor =2,
+                     alpha = 0.6,
+                     group.by = "MetaClusters")
+    p <- p  + geom_scatterpie_edit(data=scatter_iso, aes(y=imagerow, x=imagecol,group=region),
+                              #pie_scale = 2, # to increase or decrease the spot size
+                              cols=colnames(scatter_iso)[4:(ncol(scatter_iso))])+
+      scale_fill_manual(values = c(MetaTopPal,isotype_palette))
+    p <- p + ggtitle(paste0(id))+labs(fill="Isotypes\n&\nMetaClusters")
+
+    
+  ### These  are Main 3H or Sup S8D depending on sample/clone  
+    prefixe <- ifelse(file=="SP_LHD6US",yes = "Figure3H_",no = "S8D_")
+      
+    ggsave(plot = p,
+           filename =  paste0(res_folder,prefixe,file,"_",id,"_Spatial_PiePlot_isotypes_and_MetaTopics_n",n,"cells",".pdf"),
+           width = 6,height = 4)
+
+  # } # end of clone loop
+  
+} #end of file loop
+  
+```
+
+
+
+**Figure 3H** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure3H_SP_LHD6US_Clone_370_Spatial_PiePlot_isotypes_and_MetaTopics_n67cells.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure S8D** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S8D_SP_R9MS02_Clone_9_Spatial_PiePlot_isotypes_and_MetaTopics_n42cells.pdf"),density = 300)
+plot(img)
+```
+
+
+
+## Figure 3I and S8E - iGraph lineage tree reconstruction and shaping
+
+Reconstruct the graph built in python with R package iGraph in order to adapt the size, shape and color of nodes.
+
+Note : the script was initially built to run on all samples and all graph. It has been adapted to run on the 2 main TRIBAL graph included in the article (but everything is still available if one want to reproduce all graph ...).
+
+```{r,eval=FALSE}
+library(ggraph)
+library(tidygraph)
+SampleId <- Anonym_table$SpatialVDJ_id
+
+IDmatch <- Anonym_table$SpatialGEX_id
+names(IDmatch) <- SampleId
+
+
+isotype_palette <- c("IGHM"="#253494", "IGHD"="#1D91C0", "IGHG1"="#d62728", "IGHG2"="#ff7f0e",  "IGHG3"="#FF6EC7", "IGHG4"="#FCCF05", "IGHA1"="#2ca02c", "IGHA2"="#36e40a","IGHE"="#8c564b","IGH_NA"="grey")
+
+Order <- c("IGHM","IGHD","IGHG3","IGHG1","IGHA1","IGHG2","IGHG4","IGHE","IGHA2","IGH_NA")
+
+my_colors <- c("#66b803", "#f94144", "#f8961e", "#3574b8", "#DE77AE", "#9970AB", "#D5E4A2", "#71D0F5", "#B1746F", "#ADE2D0", "#20DE8BFF", "#CCDE8BFF", "#f7f31c", "#FFA88BFF", "#FF6A8BFF")
+
+#V1 - to generate all plot in all condition tested and all samples ...
+
+##### Choose No_Bin CellTopics and the MOVICS consensus clustering MetaTopics with k=7
+# run for both No_bin and Bin for consistency in plot (pipeline already run, overide the Bin plot from another clustering strategy ...) but finally consider only No_hin
+# BinOrNot<-c(No_bin="No_bin",Bin="Bin") 
+# 
+# for(bin in BinOrNot){
+#   TribalPlot<-list()
+#   for(file in FileID){
+#     #Airr path and load airr
+#     # PAth of the final IGH clone with germline reconstruct database
+#     file_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass.tsv")
+#     ## Load airr 
+#     airr <- read_rearrangement(file_path)
+#     ## Create a cell column by concatenating the SB and the clonotype_id
+#     airr$cell <- paste(airr$sb,airr$clonotype_id,sep = "-")
+#     airr$cell<-gsub("_","-",airr$cell)
+#     ## Add the string "Clone_" before the clone_id to match the required format of TRIBAL
+#     airr$clone_id <- paste0("Clone_",airr$clone_id)
+#     
+#     #Load the Seurat object with the metadata containing the MetaTopic info
+#     Seurat <- readRDS(paste0("PATH/",file,"_seurat_sct_BayesSpace_Starfysh_TLSsign_SpaTopic_CellTopic_",bin,"_MetaTopicMOVICS",".rds"))
+#     SpotsMetaTopics <-Seurat$MetaTopic
+#     ##Palette of MetaTopics
+#     MetaTopPal <- my_colors[1:length(levels(Seurat$MetaTopic))]
+#     names(MetaTopPal)<-levels(Seurat$MetaTopic)#unify the color of metatopic
+#     
+#     # Path of results of TRIBAL
+#     tribal_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/TRIBAL_tree/",file,"/results/")
+#     ## Get names of Clones 
+#     CloneID <- list.files(tribal_path) # get all files in the results folders
+#     CloneID <- gsub("Clone_","Clone-",CloneID) # change the first _ to -
+#     CloneID <- gsub("_.*","",CloneID) # remove everything after the _
+#     CloneID <- gsub("-","_",CloneID) # get back to - in _
+#     CloneID <- unique(CloneID) # get unique id
+#     
+#     ggplot<-list()
+#     #iterate on each clone ID
+#     for(id in CloneID){
+#       #Load edges
+#       edges <- read.delim(paste0(tribal_path,id,"_edge_list0.txt"),header = F,sep = ",")
+#       colnames(edges)<-c("from","to")
+#       
+#       #Load nodes
+#       ##Load nodes and isotypes
+#       nodes <- read.delim(paste0(tribal_path,id,"_isotypes0.csv"),header = F,sep = ",")
+#       colnames(nodes)<-c("id","isotype")
+#       nodes$isotype<- factor(nodes$isotype,levels = Order) #order according to genome
+#       ## get the information on clonotype for the corresponding clone
+#       airr_sub_clone<-data.frame(airr[airr$clone_id %in% id,])
+#       rownames(airr_sub_clone)<-airr_sub_clone$cell #names according to cell unique id
+#       ## Add umi_count for each node
+#       nodes$umi_count <-airr_sub_clone[nodes$id,"umi_count"]
+#       ## Add secreted or membrane form for each node
+#       nodes$form <-airr_sub_clone[nodes$id,"c_imgtref_form"]
+#       nodes$form <- ifelse(is.na(nodes$form),yes = NA,
+#                           no = ifelse(nodes$form %in% "Secreted",yes = "S",
+#                         no = ifelse(nodes$form %in% "Membrane",yes = "M",no = "?")))
+#       nodes$form<-factor(nodes$form,levels=c("S","M","?"))
+#       
+#       #specified the form scale
+#       Form_scale <- c(S=16,M=17,"?"=15)
+#       
+#       ## Retrieve spot Name and add the MetaTopic info to node data.frame
+#       nodes$spot_id <- gsub("-Group.*","-1",nodes$id)
+#       nodes$MetaTopic<-SpotsMetaTopics[nodes$spot_id]
+# 
+#       
+#       #Create the graph
+#       mygraph<-tidygraph::tbl_graph(nodes = nodes, edges = edges,directed = T)
+#       
+#       #number of sequences/cells
+#       n<-sum(!is.na(nodes$umi_count))
+#       
+#       plot<-ggraph(mygraph, layout = "tree") + 
+#         geom_edge_diagonal()+
+#         geom_node_point(aes(fill=isotype),shape=23,size=2)+
+#         geom_node_point(aes(color=MetaTopic,shape=form),size=4)+
+#         #geom_node_point(aes(color=nodes$BayesSpace),size = 5) + 
+#         #geom_node_text(aes(label = form), vjust = 1.5) + 
+#         theme_graph(base_family = "")+
+#         #theme_void()+
+#         # theme(panel.grid = element_blank(),
+#         #         axis.text = element_blank(),
+#         #         axis.ticks  = element_blank(),
+#         #         axis.title = element_blank())+
+#         scale_fill_manual(values = isotype_palette)+
+#         scale_color_manual(values = MetaTopPal)+
+#         scale_shape_manual(values = Form_scale)+
+#         labs(title = paste("TRIBAL isotype aware tree"),subtitle = paste(file,"-",id,"\n","n","=",n,"cells (clonotypes/spots)"),
+#              fill="Isotype")
+#       #Plot the graph
+#       ggplot[[id]]<-list(plot=plot,
+#         n=n)
+#       
+#       ## Save the plot
+#       ggsave(plot = ggplot[[id]]$plot,
+#            filename =paste0(res_folder,"04_Clone_IgBlast_in_MetaTopics/TRIBAL_tree/MetaTopic_",bin,"/",file,"/","TRIBAL_Tree0_iGraph_n",n,"cells_",id,".pdf"),
+#            width = 15,height = 6)
+#     }
+#     TribalPlot[[file]]<-ggplot
+#   }
+#   
+#   #Order by number of seq by clone
+#   Reorder<-lapply(TribalPlot,function(id_list){
+#       names(sort(sapply(id_list,function(clone)clone$n),decreasing = T))
+#   })
+#   TribalPlot<-lapply(FileID,function(id_tum){
+#     tmp<-TribalPlot[[id_tum]]
+#     ord<-Reorder[[id_tum]]
+#     lapply(tmp[ord],function(newlist)newlist$plot)
+#   })
+# 
+# }
+
+#V2 : only to reproduce the selected plot
+bin<-"No_bin"
+
+# Following script initially supposed to loop on all file and all clone but here it will be used only to reproduce :
+### The Main Figure 3H (tumor SP_LHD6US and clone == 370)
+### The Supplementary Figure S8D (tumor SP_R9MS02 and clone == 9)
+
+for(file in c("SP_LHD6US","SP_R9MS02")){
+  #Airr path and load airr
+  # PAth of the final IGH clone with germline reconstruct database
+  # file_path <- paste0(ImmcantationFolder,"8_PostIgBlastFilter/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_igh-form_Collapse-clonotype-split-SB_Min-2-UMI_IGH-dist_clone-pass_germ-pass.tsv")
+  # ## Load airr 
+  # airr <- read_rearrangement(file_path)
+  # ## Create a cell column by concatenating the SB and the clonotype_id
+  # airr$cell <- paste(airr$sb,airr$clonotype_id,sep = "-")
+  # airr$cell<-gsub("_","-",airr$cell)
+  # ## Add the string "Clone_" before the clone_id to match the required format of TRIBAL
+  # airr$clone_id <- paste0("Clone_",airr$clone_id)
+  
+  airr <- airr_merged[airr_merged$sampleid %in% file,] # get back the sample level table by subsetting on anonymized sample id
+  
+  #Load the Seurat object with the metadata containing the MetaTopic info
+  # Seurat <- readRDS(paste0("PATH/",file,"_seurat_sct_BayesSpace_Starfysh_TLSsign_SpaTopic_CellTopic_",bin,"_MetaTopicMOVICS",".rds"))
+  Seurat <-  suppressWarnings(subset(Srt_combined,subset = file_id == file)) # retrieve the sample level seurat by subsetting with anonymized id metadata
+  Seurat@images <- Seurat@images[file] # remvove all other images
+  SpotsMetaTopics <-Seurat$MetaClusters
+  ##Palette of MetaTopics
+  MetaTopPal <- my_colors[1:length(levels(Seurat$MetaClusters))]
+  names(MetaTopPal)<-levels(Seurat$MetaClusters)#unify the color of metatopic
+  
+  # Path of results of TRIBAL
+  tribal_path <- paste0(res_folder,"TRIBAL_to_reproduce_tree/",file,"/")
+
+  ggplot<-list()
+  #iterate on each clone ID
+  #### here adapted to run only on selected clone
+  id <- ifelse(file=="SP_LHD6US",yes = "Clone_370",no = "Clone_9") # Clone370 for SP_LHD6US / Clone_9 for SP_R9MS02
+  
+  # for(id in CloneID){
+    #Load edges
+    edges <- read.delim(paste0(tribal_path,id,"_edge_list0.txt"),header = F,sep = ",")
+    colnames(edges)<-c("from","to")
+    
+    #Load nodes
+    ##Load nodes and isotypes
+    nodes <- read.delim(paste0(tribal_path,id,"_isotypes0.csv"),header = F,sep = ",")
+    colnames(nodes)<-c("id","isotype")
+    nodes$isotype<- factor(nodes$isotype,levels = Order) #order according to genome
+    ## get the information on clonotype for the corresponding clone
+    airr_sub_clone<-data.frame(airr[airr$clone_id %in% id,])
+    
+    airr_sub_clone$cell <- gsub("-1-..-......-","-",airr_sub_clone$cell) # adjust cell_id so that it is similar to what was used in input of TRIBAL (individual, not merged for all samples, so it do not contain the name of the sample in the cell id ...)
+    
+    rownames(airr_sub_clone)<-airr_sub_clone$cell #names according to cell unique id
+    ## Add umi_count for each node
+    nodes$umi_count <-airr_sub_clone[nodes$id,"umi_count"]
+    ## Add secreted or membrane form for each node
+    nodes$form <-airr_sub_clone[nodes$id,"c_imgtref_form"]
+    nodes$form <- ifelse(is.na(nodes$form),yes = NA,
+                        no = ifelse(nodes$form %in% "Secreted",yes = "S",
+                      no = ifelse(nodes$form %in% "Membrane",yes = "M",no = "?")))
+    nodes$form<-factor(nodes$form,levels=c("S","M","?"))
+    
+    #specified the form scale
+    Form_scale <- c(S=16,M=17,"?"=15)
+    
+    ## Retrieve spot Name and add the MetaTopic info to node data.frame
+    nodes$spot_id <- gsub("-Group.*","-1",nodes$id)
+    
+    nodes$spot_id <- paste(nodes$spot_id,file,sep = "_") # add this to match name of spot in the merged file ... (with name of the file ...)
+    
+    nodes$MetaClusters<-SpotsMetaTopics[nodes$spot_id]
+
+    
+    #Create the graph
+    mygraph<-tidygraph::tbl_graph(nodes = nodes, edges = edges,directed = T)
+    
+    #number of sequences/cells
+    n<-sum(!is.na(nodes$umi_count))
+    
+    plot<-ggraph(mygraph, layout = "tree") + 
+      geom_edge_diagonal()+
+      geom_node_point(aes(fill=isotype),shape=23,size=2)+
+      geom_node_point(aes(color=MetaClusters,shape=form),size=4)+
+      #geom_node_point(aes(color=nodes$BayesSpace),size = 5) + 
+      #geom_node_text(aes(label = form), vjust = 1.5) + 
+      theme_graph(base_family = "")+
+      #theme_void()+
+      # theme(panel.grid = element_blank(),
+      #         axis.text = element_blank(),
+      #         axis.ticks  = element_blank(),
+      #         axis.title = element_blank())+
+      scale_fill_manual(values = isotype_palette)+
+      scale_color_manual(values = MetaTopPal)+
+      scale_shape_manual(values = Form_scale)+
+      labs(title = paste("TRIBAL isotype aware tree"),subtitle = paste(file,"-",id,"\n","n","=",n,"cells (clonotypes/spots)"),
+           fill="Isotype")
+
+    ## Save the plot
+      ### These  are Main 3I or Sup S8E depending on sample/clone  
+    prefixe <- ifelse(file=="SP_LHD6US",yes = "Figure3I_",no = "S8E_")
+    ggsave(plot = plot,
+         filename =paste0(res_folder,prefixe,file,"_",id,"_TRIBAL_Tree0_iGraph_n",n,"cells",".pdf"),
+         width = 15,height = 6)
+    
+  # }
+
+}  
+```
+
+
+
+**Figure 3I** 
+```{r,fig.height=7,fig.width=15}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure3I_SP_LHD6US_Clone_370_TRIBAL_Tree0_iGraph_n67cells.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure S8E** 
+```{r,fig.height=7,fig.width=15}
+img <- magick::image_read_pdf(paste0(res_folder,"S8E_SP_R9MS02_Clone_9_TRIBAL_Tree0_iGraph_n42cells.pdf"),density = 300)
+plot(img)
+```
+
+
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```

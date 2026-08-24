@@ -1,0 +1,2550 @@
+---
+title: "Ig repertoire in BioniKK ccRCC cohort vs TLS"
+author: "Guilhem Pupier"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  rmdformats::readthedown:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+-   **Preprocess** : Ig clonotypes reconstructed with MiXCR applied on frozen tumor total RNAseq data from the Bionikk cohort. RNAseq data aligned against human reference genome with STAR to compute TLS signature scores.
+
+-   **Reload data** : load all datasets generated in preprocess
+
+-   **Figure S1**
+
+-   **Ig clonotypes and TLS : Figures 1, S2, S3, S4, S5** Analyze Ig repertoire in regards to TLS measures either RNAseq-derived (TLS signatures) or TLS counted on tumors from IHC CD3-CD20 stainings / CD20-CD21/CD23 (for maturity).
+
+# Load required packages
+
+```{r}
+#NB : same packages loaded for all Figure 1 panels
+
+library(qs)
+
+library(patchwork)
+library(ggplot2)
+library(ggpubr)
+library(gridExtra)
+
+library(viridis)
+library(RColorBrewer)
+
+library(stringi)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+
+res_folder <- "PATH/Pupier_et_al_2026_Ig_TLS_ICI/Soumission1/Figure1_S1_S2_S3_S4_S5/"
+
+
+#from Heather Turner @stackoverflow ## Adapt y scale in log scale 
+base_breaksLog10 <- function(n = 10){
+  function(x) {
+    axisTicks(log10(range(x, na.rm = TRUE)), log = T, n = n)
+  }
+}
+
+base_breaksLog1p <- function(n = 10){
+  function(x) {
+    axisTicks(log1p(range(x, na.rm = TRUE)), log = T, n = n)
+  }
+}
+
+#define a pelette for isotype color consistency (if need)
+isotype_palette <- c("IGHM"="#253494", "IGHD"="#1D91C0", "IGHG1"="#d62728", "IGHG2"="#ff7f0e",  "IGHG3"="#FF6EC7", "IGHG4"="#FCCF05", "IGHA1"="#2ca02c", "IGHA2"="#36e40a","IGHE"="#8c564b","IGH_NA"="grey")
+
+# Order of IGH isotypes on the genome / IGH_NA corresponds to clonotypes where isotype was not inferred
+OrderIso <- c("IGHM","IGHD","IGHG3","IGHG1","IGHA1","IGHG2","IGHG4","IGHE","IGHA2","IGH_NA")
+```
+
+# Preprocess
+
+Bulk RNA-sequencing data generated from total RNA extracted from frozen ccRCC tumor of the BioniKK cohort. Data acquired by Gabriel Malouf. Data used for the publication Davidson et al, 2023 (see main paper bibliography). Not to be confused with bulk 3' RNA-seq data generated from FFPE tumor blocks of the same cohort and detailed in Hernandez-Verdin, Calvez, Sun, et al, 2026 (see main paper bibliography).
+
+NB : a Bionikk_metadata file containing samples info, notably TLS count in IHC (from match FFPE tumor block corresponding to the same tumor as the frozen sample used in RNA-seq) was generated and loaded before running preprocessing script \> Only sample ID / TLS count in IHC / TLS signature scores (computed bellow) are provided due to patient privacy requirement : see Bionikk_metadata_anonym.rds object (loaded in the section "Reload data").
+
+This repertoire analysis is partly adapted from a script made by Maxime Meylan for the previous article (Meylan et al, 2022, Immunity) : <https://github.com/maximemeylan/Meylan_et_al_2022/blob/main/03_bulk_clonotype_analysis.R>
+
+## Ig repertoire dataset - script adapted from Meylan et al 2022
+
+Following section was performed one time, to create a merged dataset of all mixcr clonotypes from all tumor samples (later named : **clonotype_bulk_muts_bionikk_merged.rds** / loaded in the section "Reload data")
+
+### MiXCR clonotype reconstruction from bulk RNA-seq data
+
+Mixcr runs were performed by Maxime Meylan according to the following parameters:
+
+There were 47 5' RNA-seq FF tumors in the Immunity 2022 article, same parameters for the bionik cohort with 97 samples (NB : 2 later removed : unclear origin)
+
+```{bash, eval=F}
+
+input_dir="$1"
+out_dir="$2"
+mixcr_executable="$3"
+files="$4"
+lines=`cat $files | awk '{print $1}'`
+echo $lines
+for file in $lines; do
+    echo "$file"
+    R1="${input_dir}${file}_R1.fastq.gz"
+    R2="${input_dir}${file}_R2.fastq.gz"
+    #R1="${input_dir}${file}_RNA_R1_fastq.gz"
+    #R2="${input_dir}${file}_RNA_R2_fastq.gz"
+    echo "$R1"
+
+    if test -f "$R1"; then
+  out="${out_dir}/${file}"
+  mkdir -p "$out"
+  mkdir -p "$out/clones_fastq"
+  cd $out
+
+  $mixcr_executable -Xmx48g analyze shotgun \
+    --species hs \
+    --starting-material rna \
+    --only-productive \
+    --threads 24 \
+    --align "-OsaveOriginalReads=true" \
+    --contig-assembly \
+    --impute-germline-on-export \
+    --assemble "-ObadQualityThreshold=0" \
+    "${R1}" "${R2}" "${file}repertoire"
+
+    $mixcr_executable assemble \
+                --threads 24 -f -a "${file}repertoire.vdjca" "${file}repertoire.clna"
+
+  $mixcr_executable exportReadsForClones \
+    -s "${file}repertoire.clna" "./clones_fastq/${file}_reads.fastq.gz"
+  fi
+
+done
+
+##Notes: Because RNA-Seq reads randomly cover the whole receptor gene region it is possible to assemble full-length sequences. This is usually more relevant to BCR data, because, due to hypermutations, two different clones can share same CDR3 sequence. To do that we should specify --contig-assembly option for mixcr analyze shotgun command.
+#--only-productive : Filter out-of-frame and stop-codons in export
+#--assemble "-ObadQualityThreshold=0" :
+# --impute-germline-on-export :  Use germline segments (printed with lowercase letters) for uncovered gene features.
+#--align "-OsaveOriginalReads=true" : Save original sequencing reads in .vdjca file.
+
+
+#The exportReadsForClones allows to extract original reads that was mapped to specific clones back into fastq or fasta formats.
+#The following command will create reads_cln0_R1.fastq.gz/reads_cln0_R2.fastq.gz, reads_cln1_R1.fastq.gz/reads_cln1_R2.fastq.gz, etc, containing reads corresponding to clone0, clone1 
+
+
+##For assemble:
+# -a: Save initial alignments and alignments <> clones mapping in the resulting .clna file.
+#-f : 
+
+```
+
+### Load full Bionikk repertoire data in a merged table containing every patient
+
+```{r,eval=FALSE}
+# Modified by Isaias Hernandez / Guilhem Pupier
+###########
+#########Formating data
+#########
+
+############Import clonotypes data
+
+res_folder <- "PATH/" # to adjust
+
+#bulk clonotype analysis
+clonotype_list_bionikk <- NULL
+
+file_dat <- list.files(path =c("PATH"),
+                         pattern = "repertoire.clonotypes.ALL.txt",
+                         recursive = T,
+                         full.names = T)
+
+length(file_dat)  #97 files
+
+# Remove the two (LRHX114 and LRHX19) RNAseq data (unclear origin ...) : 
+
+file_dat <- file_dat[!grepl("LRHX114",file_dat)]
+file_dat <- file_dat[!grepl("LRHX19",file_dat)]
+
+length(file_dat)  #95 files
+
+for(x in file_dat){
+  temp <- read.csv(x,sep = '\t') #Import data
+  temp$type <- substr(temp$allVHitsWithScore, start = 1, stop = 3) #Extract first 3 strings from column allVHitsWithScore
+  temp$isotype <- substr(temp[,"allCHitsWithScore"],start = 1,stop =5)
+  temp$isotype[temp$isotype == "IGHM*"] <- "IGHM"
+  temp$isotype[temp$isotype == "IGHE*"] <- "IGHE"
+  temp$isotype[temp$isotype == "IGHD*"] <- "IGHD"
+  
+  #edit names, to facilite manipulation 
+  new_name <- strsplit(x,split = "/")[[1]][length(strsplit(x,split = "/")[[1]])]# split the path name of the file and then extract the last object which is the file name
+  new_name <- gsub(pattern = "repertoire.clonotypes.ALL.txt",replacement = "",new_name) # subset in the name for the RNAseq ID only (remove repertoire.clonotypes.ALL.txt)
+  
+  temp$sampleid <- new_name
+  clonotype_list_bionikk[[new_name]] <- temp
+}
+clonotype_merged_bionikk <- Reduce(rbind,clonotype_list_bionikk) ##Merge all patients
+###This section above does similar to immunarch "repLoad" function but puts all patients in the same data.frame instead of a doing a list of data.frames
+
+length(unique(clonotype_merged_bionikk$sampleid)) #Must be 95!!
+```
+
+### Compute mutations With a Vqual threshold of 750
+
+same threshold as in Meylan et al, Immunity, 2022
+
+```{r,eval=FALSE}
+################ Alignment and mutations encoding
+# 
+library(stringr)
+library(parallel)
+time1 <- Sys.time()
+clust <- makeCluster(12)
+
+#clusterExport(clust, "clonotype_merged")
+clusterExport(clust, "stri_split")
+clusterExport(clust, "str_count")
+
+##Apply per row, per clonotype....
+mutations <- parApply(cl = clust,clonotype_merged_bionikk,1, function(x){
+  #compute J alignments
+  J_alignment <- x["allJAlignments"]
+  #J_target_length <- as.numeric(stri_split(str = J_alignment,fixed='|')[[1]][3])
+  #may be biaised by length of RNA fragment mapping
+  J_target_length <- as.numeric(stri_split(str = J_alignment,fixed='|')[[1]][5]) - as.numeric(stri_split(str = J_alignment,fixed='|')[[1]][4])
+  J_subs <- str_count(J_alignment,pattern = "S") #substitutions
+  J_ins <- str_count(J_alignment,pattern = "I")  #insertions
+  J_del <- str_count(J_alignment,pattern = "D") #deletions
+  J_all <- (J_subs+J_ins+J_del) / J_target_length #all
+  #compute V alignments
+  V_alignment <- x["allVAlignments"]
+  V_alignment <- gsub(";",",",V_alignment) #replace each ; in ,
+  # if there is multiple V alignment, they are separated by ; (> ,)
+  #take first alignment 
+  V_alignment <- unlist(stri_split(str = V_alignment,fixed=','))
+  #remove ""
+  V_alignment <- V_alignment[!V_alignment == ""]
+  # Take the last element of V_alignment (alignement score) for each
+  # alignement in V_alignment
+  V_qual <- sapply(stri_split(str = V_alignment,fixed="|"),function(splitst) as.numeric(splitst[length(splitst)]))
+  
+  
+  vquerylengths <- sapply(V_alignment,function(align){
+    align_split <- stri_split(str = align,fixed='|')[[1]] #take first alignment with the [[1]]
+    if(any(align_split!="")){
+      V_query_length <- as.numeric(align_split[5]) - as.numeric(align_split[4])
+    }else{
+      0 
+    }
+  })
+  V_query_length <- sum(vquerylengths) 
+  
+  #quality filter
+  V_alignment <- V_alignment[V_qual > 750 ] 
+  
+  #quality to return only for filtered alignements
+  V_qual <- sapply(stri_split(str = V_alignment,fixed="|"),function(splitst) as.numeric(splitst[length(splitst)]))
+  
+  #if no alignment match quality
+  V_target_length <- as.numeric(nchar(x["targetSequences"]))
+  if(identical(character(0),V_alignment)){
+    return(c('J_target_length' =J_target_length,
+             "J_mutation_freq"=NA,
+             "J_mutation_perc"=NA,
+             'V_target_length' =V_target_length,
+             "V_query_length"=NA,
+             "V_mutation_freq"=NA,
+             "V_qual"=NA,
+             "V_mutation_perc"=NA))
+  }else{
+    V_subs <- str_count(x["allVAlignments"],pattern = "S")
+    V_ins <- str_count(x["allVAlignments"],pattern = "I")
+    V_del <- str_count(x["allVAlignments"],pattern = "D")
+    V_all <- (V_subs+V_ins+V_del) / V_query_length
+    return(c('J_target_length' =J_target_length,
+             "J_mutation_freq"=(J_subs+J_ins+J_del),
+             "J_mutation_perc"=J_all,
+             'V_target_length' =V_target_length,
+             "V_query_length"=V_query_length,
+             "V_mutation_freq"=(V_subs+V_ins+V_del),
+             "V_qual"=median(V_qual),
+             "V_mutation_perc"=V_all))
+  }
+})
+
+
+####
+time2 <- Sys.time()
+time2 - time1
+stopCluster(clust)
+mutations <- t(mutations)
+clonotype_bulk_muts_bionikk <- cbind(clonotype_merged_bionikk,mutations)
+
+#take only best alignments score
+
+time1 <- Sys.time()
+clust <- makeCluster(32)
+clusterExport(clust, "stri_split")
+clusterExport(clust, "str_count")
+
+##Apply again per clone/row
+## the [1] allows to extract the best alignment in allV/D/J/CHitsWithScore col (after the character has been splited)
+res <- parApply(cl = clust,clonotype_bulk_muts_bionikk,1, function(x){
+  best_V <- strsplit(x["allVHitsWithScore"],split = "\\*")[[1]][1]
+  best_V <- factor(best_V,levels=rev(names(sort(table(best_V),decreasing = T))))
+  best_D <- strsplit(x["allDHitsWithScore"],split = "\\*")[[1]][1]
+  best_J <- strsplit(x["allJHitsWithScore"],split = "\\*")[[1]][1]
+  best_C <- strsplit(x["allCHitsWithScore"],split = "\\*")[[1]][1]
+  gene_used <- paste0(best_V,"_",best_D,"_",best_J)
+  gene_used <- gsub(pattern = "_NA",replacement = "",gene_used)
+  
+  full_length_id_nseq<-  toupper(paste0(x[c("nSeqImputedFR1","nSeqImputedCDR1",
+                                            "nSeqImputedFR2","nSeqImputedCDR2",
+                                            "nSeqImputedFR3","nSeqImputedCDR3",
+                                            "nSeqImputedFR4")]
+                                        ,collapse = ""))
+  
+  full_length_id_aaseq<- toupper(paste0(x[c("aaSeqImputedFR1","aaSeqImputedCDR1",
+                                            "aaSeqImputedFR2","aaSeqImputedCDR2",
+                                            "aaSeqImputedFR3","aaSeqImputedCDR3",
+                                            "aaSeqImputedFR4")],
+                                        collapse = ""))
+  return(c("best_V"=best_V,
+         "best_D"=best_D,
+         "best_J"=best_J,
+         "best_C"=best_C,
+         "gene_used"=gene_used,
+         "full_length_id_nseq"=full_length_id_nseq,
+         "full_length_id_aaseq"=full_length_id_aaseq))
+})
+time2 <- Sys.time()
+time2 - time1
+stopCluster(clust)
+res <- t(res)
+clonotype_bulk_muts_bionikk <- cbind(clonotype_bulk_muts_bionikk,res)
+
+var_to_check <- c("cloneCount","V_mutation_perc","V_mutation_freq","V_target_length")
+
+head(clonotype_bulk_muts_bionikk[,c(var_to_check,"cloneId","sampleid")])
+
+##save data > comment (add a #) when done the first time to avoid overwriting...
+
+# saveRDS(clonotype_bulk_muts_bionikk, file = "PATH/clonotype_bulk_muts_bionikk_1_base.rds") ## renamed : clonotype_bulk_muts_bionikk_merged.rds
+```
+
+## RNAseq TLS signatures
+
+Align RNA-seq raw data to human genome and generate a gene count matrix to finally compute TLS signature scores.
+
+### Pre-process fastq
+
+#### Alignment of raw data with STAR v2.7.2a
+
+```{bash, eval=F}
+#To do in a microenvironment containing STAR v2.7.2a
+## >> conda activate STAR27a
+
+## NB : the number corresponds to anonym id
+
+for i in 4 7 8 9 10 11 12 13 15 16 17 19 20 21 22 23 24 25 26 28 29 30 31 32 34 35 36 37 38 39 41 42 43 45 46 49 53 54 55 56 57 58 61 64 69 71 73 74 76 100 101 102 103 105 106 107 108 109 111 113 114 116 117 118 121 122 123 124 125 127 128 129 133 135 139 140 142 143 145 148 149 155 156 157 163 166 167 168 170 171 172 173 174 175 177 178 179; do time STAR --genomeDir PATH/STAR_index --runThreadN 20 --quantMode GeneCounts --readFilesCommand zcat --readFilesIn PATH/LRHX${i}.R1.fastq.gz PATH/LRHX${i}.R2.fastq.gz --twopassMode Basic --outSAMunmapped Within --chimJunctionOverhangMin 12 --chimOutJunctionFormat 1 --alignSJDBoverhangMin 10 --chimSegmentMin 12 -alignMatesGapMax 100000 --alignIntronMax 100000 --alignSJstitchMismatchNmax 5 -1 5 5 --outSAMattrRGline ID:GRPundef --chimMultimapScoreRange 3 --chimScoreJunctionNonGTAG -4 --chimMultimapNmax 20 --chimNonchimScoreDropMin 10 --peOverlapNbasesMin 12 --peOverlapMMp 0.1 --outSAMtype BAM SortedByCoordinate --outFileNamePrefix PATH/aligned_STAR/LRHX${i}; done
+```
+
+#### Assemble all ReadPerGene in one unique table
+
+**STAR Manual Guide** : STAR outputs read counts per gene into ReadsPerGene.out.tab file with 4 columns : - **column 1: gene ID**\
+- column 2: counts for unstranded RNA-seq\
+- column 3: counts for the 1st read strand aligned with RNA (htseq-count option -s yes)\
+- **column 4: counts for the 2nd read strand aligned with RNA (htseq-count option -s reverse)**
+
+The column of reads count to keep is : - the second if the data are unstranded - the third if the data are stranded 1st read forward ("++,--" in RSeQC) - the fourth if the data are stranded 1st read reverse ("+-,-+" in RSeQC)
+
+```{r,eval=FALSE}
+## Combine each sample in one table 
+ReadPerGene_file <- list.files(path = "PATH/aligned_STAR",
+                               full.names = T,
+                               pattern = "ReadsPerGene.out.tab")
+
+length(ReadPerGene_file) ## should be 97 ## Ok
+
+ReadPerGene_bionikk <- NULL
+for(x in ReadPerGene_file){
+  temp <- read.csv(x,sep = '\t',header = F,skip = 4) #Import STAR aligned data and skip 4 first header lines
+  temp <- temp[,c(1,4)] ## keep only the 1st col (geneID) and the 4th col (Reads counts stranded reverse)
+  patientID <- gsub("ReadsPerGene.out.tab","",gsub("PATH/aligned_STAR/","",x))
+  colnames(temp) <- c("geneID",patientID)
+  if(is.null(ReadPerGene_bionikk)){
+    ReadPerGene_bionikk <- temp
+  }else{
+    ReadPerGene_bionikk <- merge(ReadPerGene_bionikk,temp,by.x = "geneID", all.x = T)
+  }
+}
+
+# write.table(ReadPerGene_bionikk, file = "PATH/Bionikk_fiveprime_STAR_ReadsPerGene.txt", row.names = FALSE, quote = F, sep = "\t")
+```
+
+### Import and normalize 5'RNAseq data from Bionikk cohort
+
+The **DESeq2 package** is used to import data, filter data and create a dds object in order to normalize data. There won't be differential analysis done. See : [DESeq2 vignette](http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html) NB : an arbitrary design is create just to be able to create the dds object and normalize data (it won't be used for differential analysis ...)
+
+The **biomaRt package** is used to convert ensembl name to gene name. See : [biomaRt package Vignette](https://bioconductor.org/packages/release/bioc/vignettes/biomaRt/inst/doc/accessing_ensembl.html) NB : some unnecessary lines are present (transcript id, etc // come from old scripts ...) but biomaRt was finally used here only for ensembl_gene toward gene name conversion
+
+```{r,eval=FALSE}
+#####################################################
+#To be able to convert Ensembl gene id to gene names
+#####################################################
+library(biomaRt)
+
+# I - Find the name of the biomart
+###first step is to find the names of the BioMart services Ensembl is currently providing
+listEnsembl()
+
+# The first column gives us the name we should provide to the biomart argument in useEnsembl(), and the second gives a more comprehensive title for the dataset along with the Ensembl version.
+
+ensembl <- useEnsembl(biomart = "genes")
+
+
+# II - Choosing a dataset
+### BioMart databases can contain several datasets
+### Example : within the Ensembl genes mart every species is a different dataset.
+### the functions searchDatasets() which will try to find any entries matching a specific term or pattern.
+searchDatasets(mart = ensembl, pattern = "hsapiens")
+
+### To use a dataset we can update our Mart object using the function useDataset()
+ensembl <- useDataset(dataset = "hsapiens_gene_ensembl", mart = ensembl)
+
+
+# III - Other way to connect to a specified BioMart database and dataset
+#The useMart function enables one to connect to a specified BioMart database and dataset within this database
+#Possible database names can be retrieved with the functio listMarts
+listMarts()
+#Collecting gene names
+mart <- biomaRt::useMart(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", host = 'ensembl.org')
+
+
+# IV - How to build a biomaRt query
+##Once we’ve selected a dataset to get data from, we need to create a query and send it to the Ensembl BioMart server
+## The getBM() function has four main arguments : mart, filters, values and attributes
+## - mart is an object of class Mart, which is created by the useEnsembl()/useMart() function.
+## - Filters and values are used to define restrictions on the query
+### e.g. :  all genes located on the human X chromosome then the filter chromosome_name can be used with value ‘X’
+## - Attributes define the data we are interested in retrieving.
+## listAttributes() function displays all available attributes in the selected dataset
+
+attributes <- listAttributes(mart)
+attributes[1:5,]
+
+#Given a set of filters and corresponding values, it retrieves the user specified attributes from the BioMart database one is connected to.
+tgn <- biomaRt::getBM(attributes = c("ensembl_transcript_id", "ensembl_gene_id", "external_gene_name"), mart =mart)
+
+#next step is only to rename some columns for personal use
+tgn <- dplyr::rename(tgn, transcript_id = ensembl_transcript_id, gene_id = ensembl_gene_id, gene_name = external_gene_name)
+#next step is to select only the columns we are interested in
+head(tgn)
+
+gene2name<-tgn[,c(2,3)] ##a two-column data.frame linking gene id (column 2) to gene name (column 3). 
+gene2name <- gene2name[!duplicated(gene2name$gene_id),] ## extract duplicated ligns
+
+########################################################
+#Normalization of reads count with the DESeq2 package
+########################################################
+
+# Open the count matrix
+cts <- as.matrix(read.csv("PATH/Bionikk_fiveprime_STAR_ReadsPerGene.txt",sep="\t",row.names="geneID")) 
+
+## Rename rownames from the cts (ensembl gene id) to gene name with the gene2name df
+to_rename <- rownames(cts)[(rownames(cts) %in% gene2name$gene_id)]
+for(i in seq_len(nrow(cts))){
+  Gene_id <- rownames(cts)[i]
+  if(Gene_id %in%to_rename){
+    Gene_name <- gene2name[gene2name$gene_id== Gene_id,"gene_name"]
+    if(Gene_name == ""){
+      next
+    }else{
+      rownames(cts)[i] <- Gene_name
+    }
+  }
+}
+
+# Create a table with sample id in rownames and different factor to add to the design in columns
+## Here : an arbitrary "condition" column is created just to create the dds object
+coldata <- data.frame(condition=factor(c(rep("A",50),rep("B",47))),row.names = colnames(cts))
+
+coldata$condition <- factor(coldata$condition)
+
+##examine the count matrix and column data to see if they are consistent in terms of sample order
+#absolutely critical that the columns of the count matrix and the rows of the column data (information about samples) are in the same order
+head(cts,2)
+coldata
+all(colnames(cts)==rownames(coldata)) #Must be true
+
+#construct a DESeqDataSet
+library("DESeq2")
+dds <- DESeqDataSetFromMatrix(countData = cts,
+                              colData = coldata,
+                              design = ~ condition)
+dds #dim: 60617 97 
+
+# While it is not necessary to pre-filter low count genes before running the DESeq2 functions, there are two reasons which make pre-filtering useful: by removing rows in which there are very few reads, we reduce the memory size of the dds data object, and we increase the speed of the transformation and testing functions within DESeq2. It can also improve visualizations, as features with no information for differential expression are not plotted.
+# 
+# Here we perform a minimal pre-filtering to keep only rows that have at least 2 reads total. 
+dim(dds)       # [1] 60617 97 
+keep <- rowSums(counts(dds)) >= 2
+dds <- dds[keep,]
+dim(dds)       # [1] 49918    97
+
+
+dds <- DESeq(dds)
+
+#Data transformations and visualization
+
+###Extract transformated values
+##In order to test for differential expression, we operate on raw counts and use discrete distributions as described in the previous section on differential expression. However for other downstream analyses – e.g. for visualization or clustering – it might be useful to work with transformed versions of the count data.
+##VST= variance stabilization transformation
+#The assay function is used to extract the matrix of normalized values.
+
+vsd <- vst(dds, blind=FALSE)
+bionikk_deseq<-assay(vsd)
+
+# Coerce in data.frame
+bionikk_deseq<-as.data.frame(bionikk_deseq)
+
+##Save as rds object...
+# saveRDS(bionikk_deseq,file = "PATH/bionikk_fiveprime_star_vst_normalized_expression.rds")
+```
+
+### TLS signatures rds
+
+Generate a rds file containing TLS_signatures (same in script Figure 2)
+
+```{r}
+TLSsign <-list()
+#Signatures from the Fridman et al 2023 Immunity review (cancer immunity intra tumoral cycle)
+TLSsign[["Hennequin_th1_B"]] <- c("CD4", "CCR5", "CXCR3","CSF2", "IGSF6", "IL2RA", "CD38", "CD40", "CD5", "MS4A1", "SDC1", "GFI1", "IL1R1", "IL1R2", "IL10", "CCL20", "TRAF6", "STAT5A")
+TLSsign[["Kroeger_PC"]]  <- c("TNFRSF17","JCHAIN")
+TLSsign[["Gu_Trantien_Tfh"]]  <- c("CXCL13", "CD200", "FBLN7","ICOS", "SGPP2", "SH2D1A",
+"TIGIT", "PDCD1")
+TLSsign[["Coppola_12chems"]]  <- c("CCL2","CCL3","CCL4","CCL5","CCL8","CCL18","CCL19","CCL21","CXCL9","CXCL10","CXCL11","CXCL13")
+TLSsign[["Meylan_imprint"]]  <- readRDS("PATH/tls_signature_29.rds")
+TLSsign[["Petitprez_CXCL13"]]  <-"CXCL13"
+
+#signatures from SpaTopic article
+TLSsign[["Wu_TLS50"]] <- c("FDCSP", "CR2", "CXCL13", "LTF", "CD52", "MS4A1", "CCL19", "LINC00926", "LTB",  "CORO1A", "CD79B", "TXNIP", "CD19", "LIMD2", "CD37", "ARHGAP45", "BLK", "TMC8",  "CCL21", "PTPN6", "ATP2A3", "IGHM", "SPIB", "TMSB4X", "CXCR4", "NCF1", "CD79A", "ARHGAP9", "DEF6", "EVL", "TBC1D10C", "RASAL3", "INPP5D", "RNASET2", "RASGRP2",  "TNFRSF13C", "RAC2", "CD22", "ARHGEF1", "AC103591.3", "TRAF3IP3", "HLA-DQB1",  "CD53", "ARHGAP4", "TRBC2", "POU2AF1", "TRAF5", "OGA", "FCRL3", "HLA-DQA1")
+
+# NB correct 1-Sep to SEPTIN1 ... Excel issue
+TLSsign[["Zhang_TLS83"]] <- c("RPS15A", "CCL19", "RPS27", "CD52", "RPS6", "RPL13", "TRBC2", "RPS3A", "CORO1A", "RPL34", "RPS9", "HLA-DMA","LTB", "TRBC1", "TRAC", "RPL21", "CXCR4", "ARHGAP45", "RPS3", "CCL21", "HLA-E", "ARHGDIB", "VWF", "AEBP1",  "RPS11", "RPL18A", "HLA-DRB1", "JAK3", "LIMD2", "LAPTM5", "IGFBP7", "EVL", "IL7R", "ARHGEF1", "LUM", "CCDC85B","CCL5", "CD44", "TBC1D10C", "CD37", "ATP2A3", "ACAP1", "CD74", "CD2", "TXNIP", "HLA-DQB1", "IGHM", "VSIR", "LSP1", "HLA-DPB1", "ZAP70", "SRGN", "CD79B", "ARHGAP4", "HLA-DRA", "RAC2", "HCST", "ITGB2", "KLF2", "MFAP4", "CD3D","CYBA", "ZFP36L2", "RASAL3", "RACK1", "GMFG", "CIRBP", "NOP53", "FXYD5", "DEF6", "GSTP1", "INMT", "AKNA", "SEPTIN1", "HLA-DQA1", "CD79A", "TSC22D3", "LDHB", "COL6A2", "LAT", "RASGRP2", "EMILIN1", "HSPG2")
+
+TLSsign[["Zhang_TLS25"]] <- c("CCL19", "CD52", "TRBC2", "CORO1A", "LTB", "CXCR4", "ARHGAP45", "CCL21", "LIMD2","EVL", "ARHGEF1", "TBC1D10C", "CD37", "ATP2A3", "TXNIP", "HLA-DQB1", "CD79B", "ARHGAP4", "RAC2", "RASAL3", "DEF6", "HLA-DQA1", "CD79A", "RASGRP2", "IGHM")
+
+#TLSsign[["Stahl_BreastCancer"]] <- ???????? # do not know what is the signatures used 
+
+#Save as RDS
+saveRDS(object = TLSsign,file = "PATH/TLS_signatures.rds" )
+
+```
+
+### GSVA TLS signatures scores
+
+```{r,eval=FALSE}
+# Reload STAR aligned, DESeq2 normalized, VST transformed rnaseq data on frozen samples
+rnaseqFrozen<- readRDS(file = "PATH/bionikk_fiveprime_star_vst_normalized_expression.rds")
+rnaseqFrozen<-as.matrix(rnaseqFrozen)
+
+# run GSVA base method on vst transformed expression value (does not care which one because the gsva method depend on rank ...)
+
+# Load TLS signatures and check that all id are correct
+TLSsign <- readRDS("PATH/TLS_signatures.rds")
+all(unique(Reduce(c,TLSsign)) %in% rownames(rnaseqFrozen))
+## "AC103591.3" not in the database which is a LncRNA ... then ok
+## "IGLC1" not in the database but all other IGLC are found ... (IGLC2,3,4,5,6,7) ... Weird but probably an issue of alignment / filtering
+## The gene IGLC1 is lost because it has been filtered out from the the dds object due to a count of 0 in all the cohort ...
+
+# Run GSVA
+library(GSVA)
+
+gsva_sign<-GSVA::gsvaParam(exprData = rnaseqFrozen,
+                             geneSets = TLSsign)
+gsva.sigs<-GSVA::gsva(gsva_sign)
+
+# reformat the matrix as a data frame for each sample
+gsva.sigs <- data.frame(t(gsva.sigs))
+
+## remove samples not in Bionikk_metadata 
+gsva.sigs<-gsva.sigs[Bionikk_metadata$Anonym_ID,]
+
+## Save the res_list
+qsave(file = "PATH/20251022_GSVA_TLS_score_FrozenRNAseq.qs",
+      x = gsva.sigs)
+
+# merge metadata with rnaseq signatures scores
+colnames(gsva.sigs)<-paste(colnames(gsva.sigs),"gsva",sep = "_")
+gsva.sigs$sampleid<-rownames(gsva.sigs)
+
+Bionikk_metadata <- merge(Bionikk_metadata,gsva.sigs,
+                          by.x="Anonym_ID",by.y="sampleid",all.x=T) # NB bionikk metadata updated / see later reload section
+
+```
+
+# Reload data
+
+Load all data generated previously
+
+## Bionikk metadata anonymized
+
+Import Bionikk_metadata (anonymized) with TLS signatures/count/density values
+
+-   Anonym_ID : unique sample ID (match to clonotype table).\
+-   Primary_Meta_Frozen : tumor origin (primary tumor / metastasis / recurrence) of the frozen sample used for bulk RNA seq from which repertoire data and TLS signatures scores are derived.\
+-   Primary_Meta_FFPE : tumor origin (primary tumor / metastasis / recurrence) of the FFPE sample used for IHC/IF staining from which number (Nb) of total TLS (in CD3-CD20 IHC), as well as mature (CD21+CD23+/- in IF-IHC composite staining, see methods) and immature TLS (total TLS - mature TLS) are derived.\
+-   FFPE_tissue_type : P.O==pièce opératoire (french)==surgical tissue =/= biopsy.\
+-   "..."\_gsva : TLS signature score from 9 published TLS signatures (see methods).\
+-   New_TLS\_... : TLS number (Nb) and density (Nb / surface of tissue analyzed) in the FFPE tumor block.\
+-   New_TLSpositive : either TLS positive (\>0 TLS) or negative (0 TLS) in IHC.\
+-   New_matureTLSpositive : either TLS negative (0 TLS), only immature TLS (\> 0 TLS & mature TLS==0), or mature positive (\>0 mature TLS).
+
+```{r}
+
+Bionikk_metadata <- readRDS(paste0(res_folder,"Bionikk_metadata_anonym.rds"))
+
+## NB: TLS categories were generated in another table an inserted in the bionikk metadata. categories were built as follow :
+
+# New_TLSpositive <-ifelse(IHC_TLSmaturity$New_TLS_Total>0,
+#                                          yes = "TLStot>0",
+#                                          no = "TLStot=0")
+
+# New_matureTLSpositive <-ifelse(IHC_TLSmaturity$New_TLS_mature_Nb>0,
+#                                          yes = "TLS-mature>0",
+#                               no = ifelse(IHC_TLSmaturity$New_TLS_immature_Nb>0,
+#                                           yes = "TLS-immature-only",
+#                                           no ="TLS-negative" ))
+
+# concatenate ID anonym and PMR frozen for some plot unique id
+Bionikk_metadata$ID_PMRfrozen <- paste(Bionikk_metadata$Anonym_ID,Bionikk_metadata$Primary_Meta_Frozen,sep = "_")
+
+```
+
+## Repertoire dataset
+
+```{r}
+# reload full data
+clonotype_bulk_muts_bionikk <- readRDS(file = paste0(res_folder,"clonotype_bulk_muts_bionikk_merged.rds"))
+
+# define levels of chains (here named type ...)
+clonotype_bulk_muts_bionikk$type <- factor(clonotype_bulk_muts_bionikk$type,
+                                           levels = c("IGH","IGK" ,"IGL" ,
+                                                      "TRA", "TRB" ,"TRG" ,"TRD"))
+
+
+# Define isotypes 
+clonotype_bulk_muts_bionikk$isotype <- factor(clonotype_bulk_muts_bionikk$isotype,
+                                           levels = c(OrderIso,setdiff(unique(clonotype_bulk_muts_bionikk$isotype),OrderIso)))
+
+```
+
+# Figure S1 - correlation TLS sign and TLS ihc
+
+```{r}
+# plot a correlation heatmap of TLS sign and TLS Nb in IHC
+library(corrplot)
+
+# Correlation matrix of all rnaseq / ihc TLS measures
+CorMat<-Bionikk_metadata[,c(grep("gsva",colnames(Bionikk_metadata),value = T),
+                            grep("New_TLS",colnames(Bionikk_metadata),value = T))] # get RNAseq signatures score and TLS Nb and density in IHC
+
+CorMat<-CorMat[,setdiff(colnames(CorMat),c("New_TLSpositive"))] # remove category of TLS
+
+colnames(CorMat)[colnames(CorMat) %in% grep("New_TLS",colnames(CorMat),value = T)]<- gsub("New_","IHC_",grep("New_TLS",colnames(CorMat)[colnames(CorMat) %in% grep("New_TLS",colnames(CorMat),value = T)],value = T)) # rename new TLS count
+
+CorMat <- as.matrix(CorMat)
+CorMat <-Hmisc::rcorr(CorMat,type ="spearman" )
+diag(CorMat$P)<-0
+
+pdf(file = paste0(res_folder,"S1B_Correlation_heatmap_TLSsignatures_TLSihc.pdf"),width =9 ,height = 9)
+
+par(mar = c(7,7,9,7))   # same margin on both plot, applied only 1 time
+
+  # Base plot : half top (numbers)
+    corrplot(
+      CorMat$r,
+      method = "number",
+      # type = "lower",
+      order = "hclust",
+      tl.col = "black",
+      tl.srt = 45,
+      tl.cex = 1,
+      # tl.pos="l",
+      p.mat = CorMat$P,
+      sig.level = 0.05,
+      insig = "blank",
+      col = colorRampPalette(c("blue","white","red"))(200),
+      # col = "black",
+      # cl.pos = "b",
+      # mar = c(7,7,0,0),
+      diag = FALSE            # option : avoid double diagonal in the final composite plot
+    )
+    
+    # Ajouter la moitié inférieure en pie
+    corrplot(
+      CorMat$r,
+      add = TRUE,              # add on previous plot
+      type = "upper",
+      method = "pie",
+      order = "hclust",
+      tl.col = "black",
+      # tl.srt = 45,
+      # tl.cex = 0.8,
+      p.mat = CorMat$P,
+      sig.level = 0.05,
+      insig = "blank",
+    # mar = c(7,7,0,0),
+      col = colorRampPalette(c("blue","white","red"))(200),
+      # col = "black",
+      cl.pos = "n",
+      tl.pos = "n"             # don't print again labels
+    )
+    
+    title(main = "Spearman correlations of TLS signatures scores (n=95),\nand TLS in IHC , either total TLS (n=63) or mature TLS (n=46)",
+          line = 6             # vertical position of title
+          )
+dev.off()
+
+```
+
+**Figure S1A**
+
+```{r,fig.width=7,fig.height=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S1A_to_render_compressed.pdf"),density = 300)
+plot(img)
+```
+
+**Figure S1B**
+
+```{r,fig.width=9,fig.height=9}
+img <- magick::image_read_pdf(paste0(res_folder,"S1B_Correlation_heatmap_TLSsignatures_TLSihc.pdf"),density = 300)
+plot(img)
+```
+
+# Ig clonotypes and TLS
+
+## Figure 1A - Experimental scheme (biorender)
+
+**Figure 1A**
+
+```{r,fig.width=7,fig.height=7}
+img <- magick::image_read_pdf(paste0(res_folder,"1A_to_render_compressed.pdf"),density = 300)
+plot(img)
+```
+
+## Figure 1B - Unsupervised clustering of Ig clonotypes and TLS variables
+
+```{r}
+# Take back unique clonotypes counts for all IG loci and IGH isotypes
+Unique_clono <-tapply(clonotype_bulk_muts_bionikk$type,clonotype_bulk_muts_bionikk$sampleid,table)
+Unique_clono<-lapply(names(Unique_clono),function(id){
+  tmp<-as.data.frame(Unique_clono[[id]])
+  tmp$sampleid<-id
+  tmp
+})
+Unique_clono<-Reduce(rbind,Unique_clono)
+Unique_clono<-Unique_clono[grepl("IG",Unique_clono$Var1) ,] # keep only IG
+Unique_clono$Var1<-as.character(Unique_clono$Var1)
+
+### same for isotype
+Unique_clonoIso <-tapply(clonotype_bulk_muts_bionikk$isotype,clonotype_bulk_muts_bionikk$sampleid,table)
+Unique_clonoIso<-lapply(names(Unique_clonoIso),function(id){
+  tmp<-as.data.frame(Unique_clonoIso[[id]])
+  tmp$sampleid<-id
+  
+  ## keep only IGH iso (not IGH_NA)
+  tmp[tmp$Var1 %in% setdiff(OrderIso,"IGH_NA"),]
+})
+Unique_clonoIso<-Reduce(rbind,Unique_clonoIso)
+Unique_clonoIso$Var1<-as.character(Unique_clonoIso$Var1)
+
+# rbind
+Unique_clono<-rbind(Unique_clono,Unique_clonoIso)
+
+### LOG SCALE THE CLONOTYPE COUNT BEFORE SCALE (reduce variance ...)
+Unique_clono$Freq <-log10(Unique_clono$Freq+1)
+
+## Wider to format as matrix
+Unique_clono<-pivot_wider(Unique_clono,values_from = "Freq",names_from = "Var1")
+Unique_clono<-as.data.frame(Unique_clono)
+rownames(Unique_clono)<-Unique_clono$sampleid
+
+### Merge with score TLS in metadata
+###########################################################################
+# Merge with high/low RNAseq variables / TLS density / TLS IHC category
+## high low RNAseq variables
+# variable of metadata to iterate on
+var_TLS_rna<-grep("gsva",colnames(Bionikk_metadata),value = T)
+# retrive gsva score from bionikk_metadata
+TLSsignScores <-Bionikk_metadata[,c("Anonym_ID",var_TLS_rna)]
+
+## high low TLS density / ## TLS category
+# variable of metadata to iterate on
+var_TLS_ihc<-c(grep("New_TLS",colnames(Bionikk_metadata),value = T),
+                            "New_matureTLSpositive")
+var_TLS_ihc<- c(grep("density",var_TLS_ihc,value = T),grep("posi",var_TLS_ihc,value = T)) # keep only category and density
+# retrive tls ihc nb and category from bionikk_metadata
+TLSihc_nb_cat <-Bionikk_metadata[,c("Anonym_ID",var_TLS_ihc)]
+# rename
+var_TLS_ihc<- gsub("New_","IHC_",var_TLS_ihc) # rename new TLS count
+colnames(TLSihc_nb_cat)<-gsub("New_","IHC_",colnames(TLSihc_nb_cat))
+# convert density in high low according to median (similar as rnaseq sign)
+# retrive gsva score from bionikk_metadata
+TLSihc_nb_hl <-TLSihc_nb_cat[,c("Anonym_ID","IHC_TLS_Total_density", "IHC_TLS_immature_density", "IHC_TLS_mature_density")]
+
+####### LOG SCALE TLS DENSITY (Reduce variance ...)
+TLSihc_nb_hl$IHC_TLS_Total_density<-log10(TLSihc_nb_hl$IHC_TLS_Total_density+(10^(-4)))
+TLSihc_nb_hl$IHC_TLS_immature_density<-log10(TLSihc_nb_hl$IHC_TLS_immature_density+(10^(-4)))
+TLSihc_nb_hl$IHC_TLS_mature_density<-log10(TLSihc_nb_hl$IHC_TLS_mature_density+(10^(-4)))
+
+## merge scores and TLS ihc
+TLSsignScores<-merge(TLSsignScores,TLSihc_nb_hl,by="Anonym_ID",all.x=T)
+colnames(TLSsignScores)<-gsub("IHC_","",gsub("_gsva","",colnames(TLSsignScores)))
+
+# merge clonotype and TLS and convert in final matrix
+colnames(Unique_clono)<-paste(colnames(Unique_clono),"clonotypes",sep = "_")
+colnames(Unique_clono)<-gsub("sampleid_clonotypes","Anonym_ID",colnames(Unique_clono))
+MatrixClonoTLS<-merge(TLSsignScores,Unique_clono,by="Anonym_ID",all.x=T)
+rownames(MatrixClonoTLS)<-MatrixClonoTLS$Anonym_ID
+MatrixClonoTLS<-as.matrix(MatrixClonoTLS[,setdiff(colnames(MatrixClonoTLS),"Anonym_ID")]) 
+Heatmap_matrix<- scale(MatrixClonoTLS) #scale the heatmap (common scale) 
+Heatmap_matrix <- t(Heatmap_matrix) # transpose : var in rows
+
+
+#### annot and heatmap
+library(ComplexHeatmap)
+####### ANNOTATION WITH TLS POS/MAT in IHC COLOR PALETTE
+Heatmap_annot<-TLSihc_nb_cat[,c("Anonym_ID","IHC_TLSpositive","IHC_matureTLSpositive")]
+rownames(Heatmap_annot)<-Heatmap_annot$Anonym_ID
+Heatmap_annot<-Heatmap_annot[,setdiff(colnames(Heatmap_annot),"Anonym_ID")]
+## simplify colnames
+colnames(Heatmap_annot)<-gsub("IHC_","",colnames(Heatmap_annot))
+## as factor with correct level order
+Heatmap_annot$TLSpositive<-factor(Heatmap_annot$TLSpositive,
+                                        levels = c("TLStot=0" ,"TLStot>0"))
+
+Heatmap_annot$matureTLSpositive<-factor(Heatmap_annot$matureTLSpositive,
+                                        levels = c("TLS-negative" ,"TLS-immature-only" , "TLS-mature>0" ))
+
+ColorPal<- list(TLSpositive=c("TLStot=0"="#F16913",
+                   "TLStot>0"="#74C476" ),
+                matureTLSpositive=c(`TLS-negative`="#F16913",
+                   `TLS-immature-only`="#6A3D9A",
+                   `TLS-mature>0`="#36AAF9FF" ))
+
+## order df according to matrix and then plot
+Heatmap_annot<-Heatmap_annot[colnames(Heatmap_matrix),]
+ha_heatmap_top<-ComplexHeatmap::HeatmapAnnotation(df = Heatmap_annot,
+      # annotation_name_gp = gpar(fontsize = 9,fontface = "bold"),
+      col = ColorPal, #To specify color of each categories in each variable (same as in pheatmap)
+      # gp = gpar(col = "grey60"),
+      show_legend = T) # To hide legend if they will be created manually
+  
+## split row factors 
+spliter<-factor(ifelse(grepl("clonotypes",rownames(Heatmap_matrix)),yes = "Clonotypes",no = "TLS"),
+                levels = c("TLS","Clonotypes"))
+
+## split meta and kidney tumors
+
+CorrespID<-setNames(Bionikk_metadata$ID_PMRfrozen,nm = Bionikk_metadata$Anonym_ID)
+spliter_col<-factor(ifelse(test = grepl("primary",CorrespID[colnames(Heatmap_matrix)]),
+                           yes = "Primary" ,
+                           no = "Metastasis"),
+                    levels = c("Primary","Metastasis"))
+
+  
+  ## Same but TLS in IHC first / then TLS in RNAseq / then Clonotypes
+    # hm
+  TLSihcFirst <- c(grep("density",rownames(Heatmap_matrix),value = T),
+                   setdiff(rownames(Heatmap_matrix),grep("density",rownames(Heatmap_matrix),value = T)))
+  Heatmap_matrix_TLSihcFirst <- Heatmap_matrix[TLSihcFirst,]
+    hm<-ComplexHeatmap::Heatmap(matrix = Heatmap_matrix_TLSihcFirst,
+                                       cluster_rows = F, # to avoid clustering
+                                       cluster_columns = T,
+                                       rect_gp = gpar(col = "grey60", lwd = 1),
+                                       name = "z-score",
+                                       # col = colpal,
+                                       # column_title = variable,
+                                       column_title_gp = gpar( fontface = "bold"),
+                            # row_title = variable,
+                            show_column_names = F,
+                                       # row_names_gp = gpar(fontsize = 7),
+                                       row_split = spliter,
+                                       column_split = spliter_col, # To separate col
+                                       column_gap = unit(1.5, "mm"), ## To increase the size of the split in column
+                                       top_annotation = ha_heatmap_top,
+                                      # left_annotation = ha_heatmap_left,
+                                       # column_names_gp = gpar(fontsize =7),
+                                 border = TRUE,
+                                       na_col = "bisque4"
+                                      )
+    
+  #save the plot
+  # pdf(file = paste0(res_folder,"Heatmap_TLS_RNAseq_and_IHC_AND_UniqueClonotypes_rowsOrdered_IHCfirst.pdf"),height = 5,width = 10)
+  #   ComplexHeatmap::draw(hm)
+  # dev.off()
+  
+  
+  
+  ######## Same but without split by primary/meta >>> Annotate Primary/Meta
+  
+  ### add primary/meta to annotation
+  Heatmap_annot$Tumor_type <- spliter_col
+  Heatmap_annot <- Heatmap_annot[,c("Tumor_type",
+                                     "TLSpositive"    ,   "matureTLSpositive")]
+  
+  ## adatp palette
+    ColorPal$Tumor_type <- c("Primary"="brown",
+                             "Metastasis"="black")
+  
+  ## Check row order (same than matrix)  
+  if(!identical(rownames(Heatmap_annot),colnames(Heatmap_matrix)))stop("olala")
+  
+  ## replot
+  ha_heatmap_top<-ComplexHeatmap::HeatmapAnnotation(df = Heatmap_annot,
+      # annotation_name_gp = gpar(fontsize = 9,fontface = "bold"),
+      col = ColorPal, #To specify color of each categories in each variable (same as in pheatmap)
+      # gp = gpar(col = "grey60"),
+      show_legend = T) # To hide legend if they will be created manually
+  
+  
+  #### Same but TLS IHC first ...
+      hm<-ComplexHeatmap::Heatmap(matrix = Heatmap_matrix_TLSihcFirst,
+                                       cluster_rows = F, # to avoid clustering
+                                       cluster_columns = T,
+                                       rect_gp = gpar(col = "grey60", lwd = 1),
+                                       name = "z-score",
+                                       # col = colpal,
+                                       # column_title = variable,
+                                       column_title_gp = gpar( fontface = "bold"),
+                            # row_title = variable,
+                            show_column_names = F,
+                                       # row_names_gp = gpar(fontsize = 7),
+                                       row_split = spliter,
+                                       # column_split = spliter_col, # To separate col
+                                       column_gap = unit(1.5, "mm"), ## To increase the size of the split in column
+                                       top_annotation = ha_heatmap_top,
+                                      # left_annotation = ha_heatmap_left,
+                                       # column_names_gp = gpar(fontsize =7),
+                                 border = TRUE,
+                                       na_col = "bisque4"
+                                      )
+    
+  #save the plot
+  pdf(file = paste0(res_folder,"Figure1B_Heatmap_TLS_RNAseq_and_IHC_AND_UniqueClonotypes_rowsOrdered_PrimaryMetaNotSplit_IHCfirst.pdf"),height = 5,width = 10)
+    ComplexHeatmap::draw(hm)
+  dev.off()
+  
+```
+
+**Figure 1B**
+
+```{r,fig.height=5,fig.width=10}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure1B_Heatmap_TLS_RNAseq_and_IHC_AND_UniqueClonotypes_rowsOrdered_PrimaryMetaNotSplit_IHCfirst.pdf"),density = 300)
+plot(img)
+```
+
+## Figures 1C, 1E, S2A, S3 - Violin-boxplot rnaseq signatures (gsva)
+
+```{r,eval=FALSE}
+# compute nb of unique sequences per loci per sample ("Nb unique clonotypes")
+# clonotype_bulk_muts_bionikk$type <- factor(clonotype_bulk_muts_bionikk$type,
+#                                            levels = c("IGH","IGK" ,"IGL" ,
+#                                                       "TRA", "TRB" ,"TRG" ,"TRD"))
+Unique_clono <-tapply(clonotype_bulk_muts_bionikk$type,clonotype_bulk_muts_bionikk$sampleid,table)
+Unique_clono<-lapply(names(Unique_clono),function(id){
+  tmp<-as.data.frame(Unique_clono[[id]])
+  tmp$sampleid<-id
+  tmp
+})
+Unique_clono<-Reduce(rbind,Unique_clono)
+
+# variable of metadata to iterate on
+var_TLS_rna<-grep("gsva",colnames(Bionikk_metadata),value = T)
+
+# retrive gsva score from bionikk_metadata
+TLSsignScores <-Bionikk_metadata[,c("Anonym_ID",var_TLS_rna)]
+rownames(TLSsignScores)<-TLSsignScores$Anonym_ID
+TLSsignScores<-TLSsignScores[,setdiff(colnames(TLSsignScores),"Anonym_ID")]
+TLSsignScores<-apply(TLSsignScores,2,function(scores){
+    #define threshold
+    thresh_tlspos <- quantile(scores,probs = 0.5) #Threshold = median in the all cohort
+    scores_hl <- ifelse(scores > thresh_tlspos,"high","low")
+})
+TLSsignScores<-as.data.frame(TLSsignScores)
+TLSsignScores$sampleid<-rownames(TLSsignScores)
+
+# merge with unique_clono
+Unique_clono<-merge(Unique_clono,TLSsignScores,by ="sampleid" ,all.x=T)
+
+# melt high low
+Unique_clono <- reshape::melt.data.frame(Unique_clono,id.vars =c("sampleid", "Var1", "Freq") )
+## as factor
+Unique_clono$value <- factor(Unique_clono$value,levels = c("low","high"))
+
+# remove TR
+Unique_clono<-Unique_clono[grepl("IG",Unique_clono$Var1),]
+
+# remove gsva
+Unique_clono$variable<-factor(gsub("_gsva","",as.character(Unique_clono$variable)),
+                              levels =gsub("_gsva","",levels(Unique_clono$variable)) )
+
+# FIGURE S2A - All TLS signatures high-low / chain (IGH/K/L)
+plot<-ggplot(Unique_clono,aes(x=value,y=Freq+1,fill=value))+
+  geom_violin()+
+  geom_boxplot(fill="white",width=0.3)+
+  geom_jitter()+
+  facet_grid(Var1~variable)+ # locis vs RNAseq variable
+  theme_bw()+
+  labs(x=NULL,fill="TLS signature\nscores > median",y="Unique clonotypes +1",title =paste("Unique clonotypes per loci according to TLS signatures",paste0("(n=",length(unique(Unique_clono$sampleid)),")")) )+
+  scale_fill_manual(values = c("low"="#F16913","high"="#74C476" ))+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10")+
+  stat_compare_means(label = "p.format",vjust = 1,geom = "label")
+  
+ggsave(plot = plot,
+       filename = paste0(res_folder,"S2A_UniqueClonotypes_vs_TLSsign_violin_boxplot_allTLSsign.pdf") ,
+       width = 13,height = 6)
+
+
+### Keep also only CXCL13 IGH plot for main Figure1C
+plot<-ggplot(Unique_clono[(Unique_clono$Var1 %in% "IGH") & (Unique_clono$variable %in% "Petitprez_CXCL13"),],aes(x=value,y=Freq+1,fill=value))+
+  geom_violin()+
+  geom_boxplot(fill="white",width=0.3)+
+  geom_jitter()+
+  # facet_grid(Var1~variable)+ # locis vs RNAseq variable
+  theme_bw()+
+  labs(x="CXCL13 expression (median)",
+       # title =paste("Unique clonotypes per loci according to TLS signatures",paste0("(n=",length(unique(Unique_clono$sampleid)),")")),
+       y="Unique IGH clonotypes +1",)+
+  theme(legend.position = "none")+
+  scale_fill_manual(values = c("low"="#F16913","high"="#74C476" ))+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10")+
+  stat_compare_means()
+  
+ggsave(plot = plot,
+       filename = paste0(res_folder,"Figure1C_UniqueIGHClonotypes_vs_TLSsign_violin_boxplot_onlyCXCL13.pdf") ,
+       width = 4,height = 3)
+
+
+######### ######### ######### ######### ######### ######### 
+######### SAME BUT FOR IGH ISOTYPES
+######### ######### ######### ######### ######### ######### 
+
+# compute nb of unique sequences per IGH isotypes per sample ("Nb unique clonotypes")
+# clonotype_bulk_muts_bionikk$isotype <- factor(clonotype_bulk_muts_bionikk$isotype,
+#                                            levels = c(OrderIso,setdiff(unique(clonotype_bulk_muts_bionikk$isotype),OrderIso)))
+
+Unique_clono <-tapply(clonotype_bulk_muts_bionikk$isotype,clonotype_bulk_muts_bionikk$sampleid,table)
+Unique_clono<-lapply(names(Unique_clono),function(id){
+  tmp<-as.data.frame(Unique_clono[[id]])
+  tmp$sampleid<-id
+  
+  ## keep only IGH iso (not IGH_NA)
+  tmp[tmp$Var1 %in% setdiff(OrderIso,"IGH_NA"),]
+})
+Unique_clono<-Reduce(rbind,Unique_clono)
+
+
+# variable of metadata to iterate on
+var_TLS_rna<-grep("gsva",colnames(Bionikk_metadata),value = T)
+
+# retrive gsva score from bionikk_metadata
+TLSsignScores <-Bionikk_metadata[,c("Anonym_ID",var_TLS_rna)]
+rownames(TLSsignScores)<-TLSsignScores$Anonym_ID
+TLSsignScores<-TLSsignScores[,setdiff(colnames(TLSsignScores),"Anonym_ID")]
+TLSsignScores<-apply(TLSsignScores,2,function(scores){
+    #define threshold
+    thresh_tlspos <- quantile(scores,probs = 0.5) #Threshold = median in the all cohort
+    scores_hl <- ifelse(scores > thresh_tlspos,"high","low")
+})
+TLSsignScores<-as.data.frame(TLSsignScores)
+TLSsignScores$sampleid<-rownames(TLSsignScores)
+
+# merge with unique_clono
+Unique_clono<-merge(Unique_clono,TLSsignScores,by ="sampleid" ,all.x=T)
+
+# melt high low
+Unique_clono <- reshape::melt.data.frame(Unique_clono,id.vars =c("sampleid", "Var1", "Freq") )
+## as factor
+Unique_clono$value <- factor(Unique_clono$value,levels = c("low","high"))
+
+# remove gsva
+Unique_clono$variable<-factor(gsub("_gsva","",as.character(Unique_clono$variable)),
+                              levels =gsub("_gsva","",levels(Unique_clono$variable)) )
+
+# Figure S3
+plot<-ggplot(Unique_clono,aes(x=value,y=Freq+1,fill=value))+
+  geom_violin()+
+  geom_boxplot(fill="white",width=0.3)+
+  geom_jitter()+
+  facet_grid(Var1~variable)+ # loci vs RNAseq variable
+  theme_bw()+
+  labs(x=NULL,fill="TLS signature\nscores > median",y="Unique clonotypes +1",title =paste("Unique clonotypes per loci according to TLS signatures",paste0("(n=",length(unique(Unique_clono$sampleid)),")")) )+
+  scale_fill_manual(values = c("low"="#F16913","high"="#74C476" ))+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10")+
+  stat_compare_means(label = "p.format",vjust = 1,geom = "label")
+  
+ggsave(plot = plot,
+       filename = paste0(res_folder,"S3_UniqueClonotypes_IGHisotypes_vs_TLSsign_violin_boxplot_allTLSsign.pdf") ,
+       width = 13,height = 13)
+
+
+
+### Merge all on one plot with lines (Main Figure1E)
+##### compute each comparisons before plot (compare high vs low for each isotype)
+dataiso_cxcl13<-Unique_clono[ (Unique_clono$variable %in% "Petitprez_CXCL13"),]
+pval_data<-compare_means(Freq ~ value,dataiso_cxcl13,group.by = "Var1")
+pval_data$Freq <- Inf # add a value of y variable for plot postion
+##### plot with signif
+plot<-ggplot(dataiso_cxcl13,aes(x=Var1,y=Freq+1))+
+  geom_violin(aes(fill=Var1))+
+  geom_point()+
+  geom_line(aes(group=sampleid,color=value),alpha=0.5)+
+  theme_bw()+
+  labs(x=NULL,
+       caption="Mann-Whitney tests according to CXCL13 expression (median) / isotype",
+       color="CXCL13",
+       # title =paste("Unique clonotypes per loci according to TLS signatures",paste0("(n=",length(unique(Unique_clono$sampleid)),")")),
+       y="Unique IGH clonotypes +1",)+
+  guides(fill = guide_none())+
+  scale_fill_manual(values = isotype_palette)+
+  scale_color_manual(values = c("low"="#F16913","high"="#74C476" ))+
+  # ggsignif::geom_signif(annotations = adjp_dunn_tmp,parse = T, comparisons = comparisons_tmp, step_increase = 0.1)+
+  geom_text(data = pval_data,mapping = aes(label=p.format),vjust=1.5)+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10")
+  
+ggsave(plot = plot,
+       filename = paste0(res_folder,"Figure1E_UniqueClonotypes_IGHisotypes_vs_TLSsign_violin_onlyCXCL13_withLines.pdf") ,
+       width = 8,height = 3)
+
+```
+
+**Figure 1C**
+
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure1C_UniqueIGHClonotypes_vs_TLSsign_violin_boxplot_onlyCXCL13.pdf"),density = 300)
+plot(img)
+```
+
+**Figure 1C**
+
+```{r,fig.height=7,fig.width=8}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure1E_UniqueClonotypes_IGHisotypes_vs_TLSsign_violin_onlyCXCL13_withLines.pdf"),density = 300)
+plot(img)
+```
+
+**Figure S2A**
+
+```{r,fig.height=6,fig.width=13}
+img <- magick::image_read_pdf(paste0(res_folder,"S2A_UniqueClonotypes_vs_TLSsign_violin_boxplot_allTLSsign.pdf"),density = 300)
+plot(img)
+```
+
+**Figure S3**
+
+```{r,fig.height=13,fig.width=13}
+img <- magick::image_read_pdf(paste0(res_folder,"S3_UniqueClonotypes_IGHisotypes_vs_TLSsign_violin_boxplot_allTLSsign.pdf"),density = 300)
+plot(img)
+```
+
+## Figures 1D, S2BCD, S4, S5A - Violin-boxplot - TLS ihc
+
+```{r,eval=FALSE}
+# compute nb of unique sequences per loci per sample ("Nb unique clonotypes")
+# clonotype_bulk_muts_bionikk$type <- factor(clonotype_bulk_muts_bionikk$type,
+#                                            levels = c("IGH","IGK" ,"IGL" ,
+#                                                       "TRA", "TRB" ,"TRG" ,"TRD"))
+Unique_clono <-tapply(clonotype_bulk_muts_bionikk$type,clonotype_bulk_muts_bionikk$sampleid,table)
+Unique_clono<-lapply(names(Unique_clono),function(id){
+  tmp<-as.data.frame(Unique_clono[[id]])
+  tmp$sampleid<-id
+  tmp
+})
+Unique_clono<-Reduce(rbind,Unique_clono)
+
+# variable of metadata to iterate on
+var_TLS_ihc<-c(grep("New_TLS",colnames(Bionikk_metadata),value = T),
+                            "New_matureTLSpositive")
+var_TLS_ihc<- c(grep("density",var_TLS_ihc,value = T),grep("posi",var_TLS_ihc,value = T)) # keep only category and density
+
+# retrive tls ihc nb and category from bionikk_metadata
+TLSihc_nb_cat <-Bionikk_metadata[,c("Anonym_ID",var_TLS_ihc)]
+# rename
+var_TLS_ihc<- gsub("New_","IHC_",var_TLS_ihc) # rename new TLS count
+colnames(TLSihc_nb_cat)<-gsub("New_","IHC_",colnames(TLSihc_nb_cat))
+
+# convert density in high low according to median (similar as rnaseq sign)
+# retrive gsva score from bionikk_metadata
+TLSihc_nb_hl <-TLSihc_nb_cat[,c("Anonym_ID","IHC_TLS_Total_density", "IHC_TLS_immature_density", "IHC_TLS_mature_density")]
+rownames(TLSihc_nb_hl)<-TLSihc_nb_hl$Anonym_ID
+TLSihc_nb_hl<-TLSihc_nb_hl[,setdiff(colnames(TLSihc_nb_hl),"Anonym_ID")]
+TLSihc_nb_hl<-apply(TLSihc_nb_hl,2,function(scores){
+    #define threshold
+    thresh_tlspos <- quantile(na.omit(scores),probs = 0.5) #Threshold = median in the all cohort
+    scores_hl <- ifelse(scores > thresh_tlspos,"high","low")
+})
+TLSihc_nb_hl<-as.data.frame(TLSihc_nb_hl)
+TLSihc_nb_hl$sampleid<-rownames(TLSihc_nb_hl)
+
+
+# merge with unique_clono
+Unique_clono<-merge(Unique_clono,TLSihc_nb_cat[,c("Anonym_ID","IHC_TLSpositive","IHC_matureTLSpositive")],by.x ="sampleid" ,by.y="Anonym_ID",all.x=T)
+Unique_clono<-merge(Unique_clono,TLSihc_nb_hl,by ="sampleid",all.x=T)
+
+# melt high low
+Unique_clono <- reshape::melt.data.frame(Unique_clono,id.vars =c("sampleid", "Var1", "Freq") )
+
+# remove na
+Unique_clono<-na.omit(Unique_clono)
+
+## as factor
+Unique_clono$value <- factor(Unique_clono$value,levels = c("low","high",
+                                                          "TLStot=0" ,"TLStot>0",
+                                 "TLS-negative" ,"TLS-immature-only" , "TLS-mature>0" ))
+
+# remove TR
+Unique_clono<-Unique_clono[grepl("IG",Unique_clono$Var1),]
+
+# remove IHC
+Unique_clono$variable<-factor(gsub("IHC_","",as.character(Unique_clono$variable)),
+                              levels =gsub("IHC_","",levels(Unique_clono$variable)) )
+
+# plot
+## plot density high low
+sub_hl<-Unique_clono[grepl("density",Unique_clono$variable),]
+plot_hl<-ggplot(sub_hl,aes(x=value,y=Freq+1,fill=value))+
+  geom_violin()+
+  geom_boxplot(fill="white",width=0.3)+
+  geom_jitter()+
+  facet_grid(Var1~variable,drop = T,)+ # locis vs RNAseq variable
+  theme_bw()+
+  labs(x=NULL,fill="TLS density\n> median",y="Unique clonotypes +1",title =paste(paste0("(n=",length(unique(sub_hl$sampleid)),")")) )+
+  scale_fill_manual(values = c("low"="#F16913","high"="#74C476" ))+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10")+
+  stat_compare_means(label = "p.format",vjust = 1,geom = "label")
+
+## plot TLS pos / neg
+sub_tlspos<-Unique_clono[grepl("TLSpositive",Unique_clono$variable),]
+sub_tlspos<-sub_tlspos[!grepl("mature",sub_tlspos$variable),] # remove mature
+plot_TLSpos<-ggplot(sub_tlspos,aes(x=value,y=Freq+1,fill=value))+
+  geom_violin()+
+  geom_boxplot(fill="white",width=0.3)+
+  geom_jitter()+
+  facet_grid(Var1~variable,drop = T,)+ # locis vs RNAseq variable
+  theme_bw()+
+  labs(x=NULL,fill="TLS status",y="Unique clonotypes +1",title =paste(paste0("(n=",length(unique(sub_tlspos$sampleid)),")")) )+
+  scale_fill_manual(values = c("TLStot=0"="#F16913","TLStot>0"="#74C476" ))+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10")+
+  stat_compare_means(label = "p.format",vjust = 1,geom = "label")
+
+## plot TLS mat / im / neg with Dunn test p-values
+sub_tlsmature<-Unique_clono[grepl("TLSpositive",Unique_clono$variable),]
+sub_tlsmature<-sub_tlsmature[grepl("mature",sub_tlsmature$variable),] # keep only mature
+### Dunn test
+        #Stat post hoc
+Dunn_res  <-  lapply(unique(sub_tlsmature$Var1),function(chain){
+        subchain<-sub_tlsmature[sub_tlsmature$Var1 %in% chain,]
+        dunnRes <- dunn.test::dunn.test(x = subchain[,"Freq"],g = subchain[,"value"],method = "bh",kw = T,altp = T)
+        comparisons_tmp <- dunnRes$comparisons
+        comparisons_tmp <- strsplit(comparisons_tmp," - ")
+        adjp_dunn_tmp <- format(dunnRes$`altP.adjusted`,digits = 2,trim = T)
+        to_bold_tmp <- ifelse(as.numeric(adjp_dunn_tmp) < 0.05, paste( "*"),"ns")
+        return(list(comparisons=comparisons_tmp,
+               p_format=adjp_dunn_tmp,
+               p_signif=to_bold_tmp,
+               Var1=chain))
+    })
+names(Dunn_res)<-unique(sub_tlsmature$Var1)
+        
+### plot with global p-value
+plot_TLSmat<-ggplot(sub_tlsmature,aes(x=value,y=Freq+1,fill=value))+
+  geom_violin()+
+  geom_boxplot(fill="white",width=0.3)+
+  geom_jitter()+
+  facet_grid(Var1~variable,drop = T,)+ # locis vs RNAseq variable
+  theme_bw()+
+  scale_fill_manual(values = c(`TLS-negative`="#F16913",
+                                         `TLS-immature-only`="#6A3D9A",
+                                         `TLS-mature>0`="#36AAF9FF" ))+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10")+
+  stat_compare_means(label = "p.format",vjust = 1,geom = "label")+
+  labs(x=NULL,fill="TLS status",y="Unique clonotypes +1",title =paste(paste0("(n=",length(unique(sub_tlsmature$sampleid)),")")) )
+
+## Figure S2BCD
+plot<-(plot_TLSpos|plot_TLSmat|plot_hl)+plot_layout(guides = "collect",widths = c(1,1,3))+plot_annotation(title = "Unique clonotypes per loci according to TLS in IHC")
+
+ggsave(plot = plot,
+       filename = paste0(res_folder,"S2BCD_UniqueClonotypes_vs_TLSihc_violin_boxplot_allTLSihc.pdf") ,
+       width = 13,height = 6)
+
+
+### Keep also only TLS IHC (total) IGH plot for main Figure1D
+plot<-ggplot(Unique_clono[(Unique_clono$Var1 %in% "IGH") & (Unique_clono$variable %in% "TLSpositive"),],aes(x=value,y=Freq+1,fill=value))+
+  geom_violin()+
+  geom_boxplot(fill="white",width=0.3)+
+  geom_jitter()+
+  # facet_grid(Var1~variable)+ # locis vs RNAseq variable
+  theme_bw()+
+  labs(x=NULL,
+       # title =paste("Unique clonotypes per loci according to TLS signatures",paste0("(n=",length(unique(Unique_clono$sampleid)),")")),
+       y="Unique IGH clonotypes +1",)+
+  theme(legend.position = "none")+
+  scale_fill_manual(values = c("TLStot=0"="#F16913","TLStot>0"="#74C476" ))+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10")+
+  stat_compare_means()
+  
+ggsave(plot = plot,
+       filename = paste0(res_folder,"Figure1D_UniqueIGHClonotypes_vs_TLSihc_violin_boxplot_onlyTLSpositivity.pdf") ,
+       width = 4,height = 3)
+
+
+
+#### save for later patchwork of clonotypes (here IGH total) vs mature TLS categories (without kruskall wallis printed)
+plot_IGHclonotype<-ggplot(Unique_clono[(Unique_clono$Var1 %in% "IGH") & (Unique_clono$variable %in% "matureTLSpositive"),],aes(x=value,y=Freq+1,fill=value))+
+  geom_violin()+
+  geom_boxplot(fill="white",width=0.3)+
+  geom_jitter()+
+  # facet_grid(Var1~variable)+ # locis vs RNAseq variable
+  theme_minimal()+
+  labs(x=NULL,
+       # title =paste("Unique clonotypes per loci according to TLS signatures",paste0("(n=",length(unique(Unique_clono$sampleid)),")")),
+       y="IGH +1",)+
+  theme(legend.position = "none",
+          axis.text.x = element_text(angle=45, hjust = 1))+
+  scale_fill_manual(values = c(`TLS-negative`="#F16913",
+                                           `TLS-immature-only`="#6A3D9A",
+                                           `TLS-mature>0`="#36AAF9FF" ))+
+  ggsignif::geom_signif(annotations = Dunn_res[["IGH"]]$p_format ,parse = F, comparisons = Dunn_res[["IGH"]]$comparisons, step_increase = 0.2,textsize = 3)+
+  # stat_compare_means(vjust = +25)+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10",
+                     expand = expansion(mult = 0.2))
+
+
+
+######### ######### ######### ######### ######### ######### 
+######### SAME BUT FOR IGH ISOTYPES
+######### ######### ######### ######### ######### ######### 
+
+
+## relevel isotypes for IGH 
+clonotype_bulk_muts_bionikk_IGH <- clonotype_bulk_muts_bionikk
+# clonotype_bulk_muts_bionikk_IGH$sampleid<-factor(clonotype_bulk_muts_bionikk_IGH$sampleid)
+clonotype_bulk_muts_bionikk_IGH$isotype<-as.character(clonotype_bulk_muts_bionikk_IGH$isotype)
+# clonotype_bulk_muts_bionikk_IGH<-clonotype_bulk_muts_bionikk_IGH[clonotype_bulk_muts_bionikk_IGH$type %in% "IGH",]
+clonotype_bulk_muts_bionikk_IGH$isotype<-ifelse( (clonotype_bulk_muts_bionikk_IGH$type =="IGH") & (clonotype_bulk_muts_bionikk_IGH$isotype==""),
+                              yes = "IGH_NA",
+                              no = clonotype_bulk_muts_bionikk_IGH$isotype)
+clonotype_bulk_muts_bionikk_IGH$isotype<-factor(clonotype_bulk_muts_bionikk_IGH$isotype,
+                              levels = c("IGHM",   "IGHD"  ,
+                                         "IGHG3",  "IGHG1" , "IGHA1" ,"IGHGP",
+                                         "IGHG2",  "IGHG4",  "IGHE",   "IGHA2",
+                                         "IGH_NA"))
+
+# compute nb of unique sequences per IGH isotypes per sample ("Nb unique clonotypes")
+Unique_clono <-tapply(clonotype_bulk_muts_bionikk_IGH$isotype,clonotype_bulk_muts_bionikk_IGH$sampleid,table)
+
+Unique_clono<-lapply(names(Unique_clono),function(id){
+  ### keep only IGH_Iso
+  tmp<-(Unique_clono[[id]])
+  tmp<-tmp[c("IGHM",   "IGHD"  ,
+             "IGHG3",  "IGHG1" , "IGHA1" ,"IGHGP",
+             "IGHG2",  "IGHG4",  "IGHE",   "IGHA2",
+             "IGH_NA")]
+
+  tmp<-as.data.frame(tmp) # convert in data.frame
+  tmp$sampleid<-id
+  
+  tmp
+})
+Unique_clono<-Reduce(rbind,Unique_clono)
+
+
+# merge with unique_clono
+Unique_clono<-merge(Unique_clono,TLSihc_nb_cat[,c("Anonym_ID","IHC_TLSpositive","IHC_matureTLSpositive")],by.x ="sampleid" ,by.y="Anonym_ID",all.x=T)
+Unique_clono<-merge(Unique_clono,TLSihc_nb_hl,by ="sampleid",all.x=T)
+
+# melt high low
+Unique_clono <- reshape::melt.data.frame(Unique_clono,id.vars =c("sampleid", "Var1", "Freq") )
+
+# remove na
+Unique_clono<-na.omit(Unique_clono)
+
+## as factor
+Unique_clono$value <- factor(Unique_clono$value,levels = c("low","high",
+                                                          "TLStot=0" ,"TLStot>0",
+                                 "TLS-negative" ,"TLS-immature-only" , "TLS-mature>0" ))
+
+# remove TR
+Unique_clono<-Unique_clono[grepl("IG",Unique_clono$Var1),]
+
+# remove IHC
+Unique_clono$variable<-factor(gsub("IHC_","",as.character(Unique_clono$variable)),
+                              levels =gsub("IHC_","",levels(Unique_clono$variable)) )
+
+
+# plot
+## plot density high low
+sub_hl<-Unique_clono[grepl("density",Unique_clono$variable),]
+plot_hl<-ggplot(sub_hl,aes(x=value,y=Freq+1,fill=value))+
+  geom_violin()+
+  geom_boxplot(fill="white",width=0.3)+
+  geom_jitter()+
+  facet_grid(Var1~variable,drop = T,)+ # locis vs RNAseq variable
+  theme_bw()+
+  labs(x=NULL,fill="TLS density\n> median",y="Unique clonotypes +1",title =paste(paste0("(n=",length(unique(sub_hl$sampleid)),")")) )+
+  scale_fill_manual(values = c("low"="#F16913","high"="#74C476" ))+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10")+
+  stat_compare_means(label = "p.format",vjust = 1,geom = "label")
+
+## plot TLS pos / neg
+sub_tlspos<-Unique_clono[grepl("TLSpositive",Unique_clono$variable),]
+sub_tlspos<-sub_tlspos[!grepl("mature",sub_tlspos$variable),] # remove mature
+plot_TLSpos<-ggplot(sub_tlspos,aes(x=value,y=Freq+1,fill=value))+
+  geom_violin()+
+  geom_boxplot(fill="white",width=0.3)+
+  geom_jitter()+
+  facet_grid(Var1~variable,drop = T,)+ # locis vs RNAseq variable
+  theme_bw()+
+  labs(x=NULL,fill="TLS status",y="Unique clonotypes +1",title =paste(paste0("(n=",length(unique(sub_tlspos$sampleid)),")")) )+
+  scale_fill_manual(values = c("TLStot=0"="#F16913","TLStot>0"="#74C476" ))+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10")+
+  stat_compare_means(label = "p.format",vjust = 1,geom = "label")
+
+## plot TLS mat / im / neg with Dunn test p-values
+sub_tlsmature<-Unique_clono[grepl("TLSpositive",Unique_clono$variable),]
+sub_tlsmature<-sub_tlsmature[grepl("mature",sub_tlsmature$variable),] # keep only mature
+### Dunn test
+        #Stat post hoc
+Dunn_res  <-  lapply(unique(sub_tlsmature$Var1),function(chain){
+        subchain<-sub_tlsmature[sub_tlsmature$Var1 %in% chain,]
+        dunnRes <- dunn.test::dunn.test(x = subchain[,"Freq"],g = subchain[,"value"],method = "bh",kw = T,altp = T)
+        comparisons_tmp <- dunnRes$comparisons
+        comparisons_tmp <- strsplit(comparisons_tmp," - ")
+        adjp_dunn_tmp <- format(dunnRes$`altP.adjusted`,digits = 2,trim = T)
+        to_bold_tmp <- ifelse(as.numeric(adjp_dunn_tmp) < 0.05, paste( "*"),"ns")
+        return(list(comparisons=comparisons_tmp,
+               p_format=adjp_dunn_tmp,
+               p_signif=to_bold_tmp,
+               Var1=chain))
+    })
+names(Dunn_res)<-unique(sub_tlsmature$Var1)
+        
+### plot with global p-value
+plot_TLSmat<-ggplot(sub_tlsmature,aes(x=value,y=Freq+1,fill=value))+
+  geom_violin()+
+  geom_boxplot(fill="white",width=0.3)+
+  geom_jitter()+
+  facet_grid(Var1~variable,drop = T,)+ # locis vs RNAseq variable
+  theme_bw()+
+  scale_fill_manual(values = c(`TLS-negative`="#F16913",
+                                         `TLS-immature-only`="#6A3D9A",
+                                         `TLS-mature>0`="#36AAF9FF" ))+
+  scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10")+
+  stat_compare_means(label = "p.format",vjust = 1,geom = "label")+
+  labs(x=NULL,fill="TLS status",y="Unique clonotypes +1",title =paste(paste0("(n=",length(unique(sub_tlsmature$sampleid)),")")) )
+
+## Figure S4
+plot<-(plot_TLSpos|plot_TLSmat|plot_hl)+plot_layout(guides = "collect",widths = c(1,1,3))+plot_annotation(title = "Unique clonotypes per loci according to TLS in IHC")
+
+ggsave(plot = plot,
+       filename = paste0(res_folder,"S4_UniqueClonotypes_IGHisotypes_vs_TLSihc_violin_boxplot_allTLSihc.pdf") ,
+       width = 13,height = 13)
+
+
+
+### Keep also only TLS mature IHC & IGH plot for sup S5
+plot_TLSmatDunn<-lapply(unique(sub_tlsmature$Var1),function(chain){
+  subchain<-sub_tlsmature[sub_tlsmature$Var1 %in% chain,] # subset on chain
+  post_hoc_res<-Dunn_res[[chain]] # retrieve list of dunn.test res
+  ptmp<-ggplot(subchain,aes(x=value,y=Freq+1,fill=value))+
+    geom_violin()+
+    geom_boxplot(fill="white",width=0.3)+
+    geom_jitter()+
+    # facet_grid(.~Var1)+ #  vs IGH iso
+    theme_minimal()+
+    labs(x=NULL,
+         # title = chain,
+         # title =paste("Unique clonotypes per loci according to TLS signatures",paste0("(n=",length(unique(Unique_clono$sampleid)),")")),
+         y=paste(chain,"+1"))+
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle=45, hjust = 1))+
+    scale_fill_manual(values = c(`TLS-negative`="#F16913",
+                                             `TLS-immature-only`="#6A3D9A",
+                                             `TLS-mature>0`="#36AAF9FF" ))+
+    scale_y_continuous(breaks = base_breaksLog10(),labels = prettyNum,trans = "log10",
+                       expand = expansion(mult = 0.2))
+  
+    # Re compute kruskall wallis test. If not significant, then plot it
+  kruskallRes<-compare_means(Freq~value,data=subchain,method ="kruskal.test")
+  # else plot the Dunn test res without kruskall test
+  if(kruskallRes$p<0.05){
+    ptmp <- ptmp+
+        ggsignif::geom_signif(annotations = post_hoc_res$p_format ,parse = F, comparisons = post_hoc_res$comparisons, step_increase = 0.2,textsize = 3)
+  }else{
+    ptmp <- ptmp+
+            stat_compare_means(method ="kruskal.test")
+  }
+  ptmp
+})
+
+### Add Nb IGH total before plot
+idx<-1:length(plot_TLSmatDunn) # to reorder (11 idx)
+plot_TLSmatDunn[[length(plot_TLSmatDunn)+1]] <- plot_IGHclonotype
+plot_TLSmatDunn<-plot_TLSmatDunn[c(length(plot_TLSmatDunn),idx)]
+
+
+## Figure S5A
+plot_TLSmatDunn<-wrap_plots(plot_TLSmatDunn,ncol = 1,axes = "collect")+
+  plot_annotation(title = "IGH unique clonotype counts")
+
+
+ggsave(plot = plot_TLSmatDunn,
+       filename = paste0(res_folder,"S5A_UniqueClonotypes_IGHisotypes_vs_TLSihc_violin_boxplot_onlyTLSmaturity.pdf") ,
+       width = 4,height = 15)
+
+```
+
+**Figure 1D**
+
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure1D_UniqueIGHClonotypes_vs_TLSihc_violin_boxplot_onlyTLSpositivity.pdf"),density = 300)
+plot(img)
+```
+
+**Figure S2BCD**
+
+```{r,fig.height=6,fig.width=13}
+img <- magick::image_read_pdf(paste0(res_folder,"S2BCD_UniqueClonotypes_vs_TLSihc_violin_boxplot_allTLSihc.pdf"),density = 300)
+plot(img)
+```
+
+**Figure S4**
+
+```{r,fig.height=13,fig.width=13}
+img <- magick::image_read_pdf(paste0(res_folder,"S4_UniqueClonotypes_IGHisotypes_vs_TLSihc_violin_boxplot_allTLSihc.pdf"),density = 300)
+plot(img)
+```
+
+**Figure S5A**
+
+```{r,fig.height=15,fig.width=4}
+img <- magick::image_read_pdf(paste0(res_folder,"S5A_UniqueClonotypes_IGHisotypes_vs_TLSihc_violin_boxplot_onlyTLSmaturity.pdf"),density = 300)
+plot(img)
+```
+
+## Figures 1F, 1G, S5B - Ig counts (expansion / differentiation PC)
+
+Compute clonotype frequency and rank. Not done at clone level because it's MiXCR derived agreggated clonotypes ... Clone level is done only on Immcantation derived BCR data
+
+Some samples have really low count of clonotypes such as that the frequency of TLS negative/low are impacted by the few count of clonotypes (frequency are abberently high). In this case were clonotype can be very rare, it is better to represent and compare clonotype count rather than frequency as it is done in Meylan et al, 2022
+
+```{r}
+# Preapre data
+clone_frequency <-clonotype_bulk_muts_bionikk # just to keep same name as in immunoverse analysis (even if it is not clonal grouped ...)
+
+## factor before filter to keep all the 95 samples (even the one with no IGH ...)
+clone_frequency$sampleid<-factor(clone_frequency$sampleid)
+
+###########################################################################
+# Merge with high/low RNAseq variables / TLS density / TLS IHC category
+## high low RNAseq variables
+# variable of metadata to iterate on
+var_TLS_rna<-grep("gsva",colnames(Bionikk_metadata),value = T)
+# retrive gsva score from bionikk_metadata
+TLSsignScores <-Bionikk_metadata[,c("Anonym_ID",var_TLS_rna)]
+rownames(TLSsignScores)<-TLSsignScores$Anonym_ID
+TLSsignScores<-TLSsignScores[,setdiff(colnames(TLSsignScores),"Anonym_ID")]
+TLSsignScores<-apply(TLSsignScores,2,function(scores){
+    #define threshold
+    thresh_tlspos <- quantile(scores,probs = 0.5) #Threshold = median in the all cohort
+    scores_hl <- ifelse(scores > thresh_tlspos,"high","low")
+})
+TLSsignScores<-as.data.frame(TLSsignScores)
+TLSsignScores$sampleid<-rownames(TLSsignScores)
+
+## high low TLS density / ## TLS category
+# variable of metadata to iterate on
+var_TLS_ihc<-c(grep("New_TLS",colnames(Bionikk_metadata),value = T),
+                            "New_matureTLSpositive")
+var_TLS_ihc<- c(grep("density",var_TLS_ihc,value = T),grep("posi",var_TLS_ihc,value = T)) # keep only category and density
+# retrive tls ihc nb and category from bionikk_metadata
+TLSihc_nb_cat <-Bionikk_metadata[,c("Anonym_ID",var_TLS_ihc)]
+# rename
+var_TLS_ihc<- gsub("New_","IHC_",var_TLS_ihc) # rename new TLS count
+colnames(TLSihc_nb_cat)<-gsub("New_","IHC_",colnames(TLSihc_nb_cat))
+# convert density in high low according to median (similar as rnaseq sign)
+# retrive gsva score from bionikk_metadata
+TLSihc_nb_hl <-TLSihc_nb_cat[,c("Anonym_ID","IHC_TLS_Total_density", "IHC_TLS_immature_density", "IHC_TLS_mature_density")]
+rownames(TLSihc_nb_hl)<-TLSihc_nb_hl$Anonym_ID
+TLSihc_nb_hl<-TLSihc_nb_hl[,setdiff(colnames(TLSihc_nb_hl),"Anonym_ID")]
+TLSihc_nb_hl<-apply(TLSihc_nb_hl,2,function(scores){
+    #define threshold
+    thresh_tlspos <- quantile(na.omit(scores),probs = 0.5) #Threshold = median in the all cohort
+    scores_hl <- ifelse(scores > thresh_tlspos,"high","low")
+})
+TLSihc_nb_hl<-as.data.frame(TLSihc_nb_hl)
+TLSihc_nb_hl$sampleid<-rownames(TLSihc_nb_hl)
+
+
+## merge
+clone_frequency<-merge(clone_frequency,TLSsignScores,by="sampleid",all.x=T)
+clone_frequency<-merge(clone_frequency,TLSihc_nb_cat[,c("Anonym_ID","IHC_TLSpositive","IHC_matureTLSpositive")],by.x ="sampleid" ,by.y="Anonym_ID",all.x=T)
+clone_frequency<-merge(clone_frequency,TLSihc_nb_hl,by ="sampleid",all.x=T)
+
+####### ALL VARIABLE TO ITERATE AND PALETTE
+ALLvariable <-c(var_TLS_rna,var_TLS_ihc)
+ColorPal <- rep(list(c("low"="#F16913",
+                   "high"="#74C476" )),times=length(var_TLS_rna)+length(grep("density",var_TLS_ihc,value = T)))
+names(ColorPal)<-c(var_TLS_rna,grep("density",var_TLS_ihc,value = T))
+ColorPal$IHC_TLSpositive<-c("TLStot=0"="#F16913",
+                   "TLStot>0"="#74C476" )
+ColorPal$IHC_matureTLSpositive<-c(`TLS-negative`="#F16913",
+                   `TLS-immature-only`="#6A3D9A",
+                   `TLS-mature>0`="#36AAF9FF" )
+## as factor with correct level order
+for(var in var_TLS_rna){
+  clone_frequency[,var]<-factor(clone_frequency[,var],levels = c("low","high"))
+}
+
+for(var in grep("density",var_TLS_ihc,value = T)){
+  clone_frequency[,var]<-factor(clone_frequency[,var],levels = c("low","high"))
+}
+
+clone_frequency$IHC_TLSpositive<-factor(clone_frequency$IHC_TLSpositive,
+                                        levels = c("TLStot=0" ,"TLStot>0"))
+
+clone_frequency$IHC_matureTLSpositive<-factor(clone_frequency$IHC_matureTLSpositive,
+                                        levels = c("TLS-negative" ,"TLS-immature-only" , "TLS-mature>0" ))
+
+### Keep the table as metadata to merge back after
+meta_to_merge_back<-unique(clone_frequency[,c("sampleid",ALLvariable)])
+
+## keep only IGH for analysis of clonal (clonotype) expansion
+clone_frequency <- clone_frequency[clone_frequency$type %in% "IGH",] 
+
+
+###########################################################################
+# Clonal space (bining)
+###########################################################################
+## SECOND BINING : sums the COUNT in each bin of COUNT
+###########################################################################
+### binning the clone counts into the bins [1], [2, 3], [4, 10], [11, 30], [31, 100], and [101, MAX]
+
+### binning the clone count/ Do not rename object to avoid error in copy/paste
+bin_frequency <- clone_frequency
+bin_frequency<-tapply(bin_frequency$cloneCount,bin_frequency$sampleid,function(freq_sample){
+    bin_1<-sum(freq_sample[freq_sample==1])
+    bin_2_3<-sum(freq_sample[freq_sample>1 & freq_sample<=3])
+    bin_4_10<-sum(freq_sample[freq_sample>3 & freq_sample<=10])
+    bin_11_30<-sum(freq_sample[freq_sample>10 & freq_sample<=30])
+    bin_31_100<-sum(freq_sample[freq_sample>31 & freq_sample<=100])
+    bin_101_Max<-sum(freq_sample[freq_sample>100])
+    mat<-as.matrix(c("1"=bin_1,
+                     "2-3"=bin_2_3,
+                     "4-10"=bin_4_10,
+                     "11-30"=bin_11_30,
+                     "31-100"=bin_31_100,
+                     "101-MAX"=bin_101_Max))
+    colnames(mat)<-"Count"
+    # mat<-data.frame(mat)
+    return(mat)
+})
+
+
+bin_frequency<-lapply(names(bin_frequency),function(nam){
+  mat<-bin_frequency[[nam]]
+  if(is.null(mat)){
+    mat<-bin_frequency[["LRHX9"]] # take LRHX9 (no null) and replace with NA
+    mat[,"Count"] <- NA
+  } # null if there is 0 IGH : LRHX172
+  colnames(mat)<-nam
+  mat
+})
+
+
+bin_frequency<-Reduce(cbind,bin_frequency)
+bin_frequency<-as.data.frame(bin_frequency)
+
+bin_frequency$bin_count <-rownames(bin_frequency)
+bin_frequency$bin_count <- factor(bin_frequency$bin_count,
+                                  levels = rev(c("1","2-3","4-10","11-30","31-100","101-MAX")))
+
+
+bin_frequency<-reshape::melt.data.frame(bin_frequency,id.vars = "bin_count")
+
+## re merge with metadata (take it from Clone_frequency because level were already set)
+colnames(bin_frequency)<-c("bin_count" ,"sampleid" ,     "value"  )
+
+#### ADD PROPORTION
+bin_proportion <- clone_frequency
+bin_proportion<-tapply(bin_proportion$cloneCount,bin_proportion$sampleid,function(freq_sample){
+    #absolute count
+    bin_1<-sum(freq_sample[freq_sample==1])
+    bin_2_3<-sum(freq_sample[freq_sample>1 & freq_sample<=3])
+    bin_4_10<-sum(freq_sample[freq_sample>3 & freq_sample<=10])
+    bin_11_30<-sum(freq_sample[freq_sample>10 & freq_sample<=30])
+    bin_31_100<-sum(freq_sample[freq_sample>31 & freq_sample<=100])
+    bin_101_Max<-sum(freq_sample[freq_sample>100])
+    Total<-sum(bin_1+bin_2_3+bin_4_10+bin_11_30+bin_31_100+bin_101_Max)
+    # ratio
+    bin_1<-bin_1/Total
+    bin_2_3<-bin_2_3/Total
+    bin_4_10<-bin_4_10/Total
+    bin_11_30<-bin_11_30/Total
+    bin_31_100<-bin_31_100/Total
+    bin_101_Max<-bin_101_Max/Total
+    
+    mat<-as.matrix(c("1"=bin_1,
+                     "2-3"=bin_2_3,
+                     "4-10"=bin_4_10,
+                     "11-30"=bin_11_30,
+                     "31-100"=bin_31_100,
+                     "101-MAX"=bin_101_Max))
+    colnames(mat)<-"Proportion"
+    # mat<-data.frame(mat)
+    return(mat)
+})
+
+bin_proportion<-lapply(names(bin_proportion),function(nam){
+  mat<-bin_proportion[[nam]]
+  if(is.null(mat)){
+    mat<-bin_proportion[["LRHX9"]] # take LRHX9 (no null) and replace with NA
+    mat[,"Proportion"] <- NA
+  } # null if there is 0 IGH : LRHX172
+  colnames(mat)<-nam
+  mat
+})
+
+
+bin_proportion<-Reduce(cbind,bin_proportion)
+bin_proportion<-as.data.frame(bin_proportion)
+
+bin_proportion$bin_count <-rownames(bin_proportion)
+bin_proportion$bin_count <- factor(bin_proportion$bin_count,
+                                  levels = rev(c("1","2-3","4-10","11-30","31-100","101-MAX")))
+
+bin_proportion<-reshape::melt.data.frame(bin_proportion,id.vars = "bin_count")
+
+## rename value as proportion and merge
+colnames(bin_proportion) <-c("bin_count", "sampleid",  "proportion"    )
+bin_frequency<-merge(bin_frequency,bin_proportion,by=c("sampleid","bin_count"))
+
+# merge with metadata
+bin_frequency<-merge(bin_frequency,meta_to_merge_back,by="sampleid")
+
+
+##### iterate on each variable
+###### NB in optimisation, all variable were studied. Here only run on CXCL13, TLS IHC and TLS mature IHC
+ALLvariable <- c("Petitprez_CXCL13_gsva",
+                 "IHC_TLSpositive",
+                 "IHC_matureTLSpositive") # comment this line if you want to generate all plot
+
+for(var in ALLvariable){
+  # subset on patient non NA for the variable
+  bin_frequency_tmp<-bin_frequency
+  bin_frequency_tmp$variable<-bin_frequency_tmp[,var]
+  ## subset only non NA patients for the variable considered
+  bin_frequency_tmp<-bin_frequency_tmp[!is.na(bin_frequency_tmp$variable),]
+  
+  ## Order by continuous variable the Stacked barplot
+  ### if it's RNAseq/density/TLS-positive : one var
+  ### else if it's TLS mature : order by TLS total and by TLS maturity
+  if(var %in% c("IHC_TLSpositive","IHC_matureTLSpositive")){
+    #retrieve New_TLS_Total_Nb +/- New_TLS_mature_Nb
+    #sort according to TLS+/- mature TLS
+    if(var == "IHC_TLSpositive"){
+      sort_id <- setNames(Bionikk_metadata[,"New_TLS_Total_Nb"],
+                      nm = Bionikk_metadata[,"Anonym_ID"])
+      sort_id <- na.omit(sort_id) # remove NA
+      sort_id <- sort_id[names(sort_id) %in% unique(bin_frequency_tmp$sampleid)] # remove sample not present in final table (no IGH)
+      sort_id<-sort(sort_id) # increasing / not decreasing ... weird reading
+      sort_id <-names(sort_id)
+    }else{
+      sort_idTLSmat <- Bionikk_metadata[,c("Anonym_ID",
+                                           "New_TLS_Total_Nb",
+                                           "New_TLS_mature_Nb")]
+      rownames(sort_idTLSmat)<-sort_idTLSmat$Anonym_ID
+      sort_idTLSmat <- na.omit(sort_idTLSmat) # remove NA
+      sort_idTLSmat <- sort_idTLSmat[rownames(sort_idTLSmat) %in% unique(bin_frequency_tmp$sampleid),] # remove sample not present in final table (no IGH)
+      sort_id<-rownames(sort_idTLSmat)[order(sort_idTLSmat$New_TLS_mature_Nb,sort_idTLSmat$New_TLS_Total_Nb)] # increasing / not decreasing ... weird reading
+    }
+
+  }else{
+    sort_id <- setNames(Bionikk_metadata[,gsub("IHC_","New_",var)],
+                      nm = Bionikk_metadata[,"Anonym_ID"])
+    sort_id <- na.omit(sort_id) # remove NA
+    sort_id <- sort_id[names(sort_id) %in% unique(bin_frequency_tmp$sampleid)] # remove sample not present in final table (no IGH)
+    sort_id<-sort(sort_id) # increasing / not decreasing ... weird reading
+    sort_id <-names(sort_id)
+  }
+  
+  bin_frequency_tmp$sampleid <- factor(as.character(bin_frequency_tmp$sampleid),
+                                    levels =sort_id )
+
+  # First plot absolute count
+  p_abs<-ggplot(bin_frequency_tmp,aes(x =sampleid,y= value))+
+    geom_col(mapping = aes(fill=bin_count),color="black",position = "stack") +  # <- stack barplot
+    # geom_text(data = bin_frequency_label,mapping = aes(label=R_NR),size=3,angle=90,hjust=-0.2)+
+    # facet_grid(~sample_type,scales = "free_x",space = "free_x")+
+    theme_minimal()+
+    scale_fill_manual(values = RColorBrewer::brewer.pal(length(levels(bin_frequency_tmp$bin_count)),"Spectral"))+
+    labs(y="IGH clonotypes\ntotal counts",title = "Bin IGH clonotype read counts",
+         subtitle = paste(paste0("n=",length(unique(bin_frequency_tmp$sampleid))),
+         paste("sorted left to right according to",gsub("_gsva","",gsub("IHC_","",var)))),
+         fill="Clonotype count\ncategories",x=NULL)+
+    # theme(axis.text.x = element_text(angle=45, hjust = 1,size=7))+
+    theme(axis.text.x = element_blank())
+  
+  
+  # Second plot proportion of count
+  p_prop<-ggplot(bin_frequency_tmp,aes(x =sampleid,y= proportion))+
+    geom_col(mapping = aes(fill=bin_count),color="black",position = "stack") +  # <- stack barplot
+    # geom_text(data = bin_frequency_label,mapping = aes(label=R_NR),size=3,angle=90,hjust=-0.2)+
+    # facet_grid(~sample_type,scales = "free_x",space = "free_x")+
+    theme_minimal()+
+    scale_fill_manual(values = RColorBrewer::brewer.pal(length(levels(bin_frequency_tmp$bin_count)),"Spectral"))+
+    labs(y="Ratio of occupied\nIGH repertoire",
+         # title = "Bin IGH clonotype read counts",
+         # subtitle = paste(paste0("n=",length(unique(bin_frequency_tmp$sampleid))),
+         # paste("sorted left to right according to",gsub("_gsva","",gsub("IHC_","",var)))),
+         fill="Clonotype count\ncategories",x=NULL)+
+    theme(axis.text.x = element_text(angle=45, hjust = 1,size=7))
+  
+  
+  #patchwork of absolute count and proportion
+  p<-(p_abs/p_prop)+plot_layout(guides = "collect")
+  
+  
+  ###### FIGURE 1F (if var == CXCL13)
+  ggsave(plot = p,
+         filename = paste0(res_folder,"Figure1F_MiXCR_RNAseq_ClonotypeCounts_IGH_BinCounts_BarplotStacked_AllSamples_compare_",var,".pdf"),
+         height = 5,width = 10)
+  
+  
+  ### Statistical comparisons : boxplot
+  ##### Reverse order of level to have from left to right an increase of Count ...
+  bin_frequency_tmp$bin_count<-factor(as.character(bin_frequency_tmp$bin_count),
+                                      levels =rev(levels(bin_frequency_tmp$bin_count)) )
+  p<-ggplot(bin_frequency_tmp,aes(x =bin_count,y= value+1,fill=variable))+
+    geom_boxplot(outlier.size = 0.5,outlier.colour = "grey")+
+    geom_point(size=0.5,position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75))+
+    scale_fill_manual(values = ColorPal[[var]])+
+    scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+    # facet_grid(.~sample_type,scales = "free_x",space = "free_x")+
+    stat_compare_means(label = "p.signif")+
+    theme_minimal()+
+    # theme(legend.position = "none")+
+    labs(y="IGH clonotype counts+1",title = "Bin IGH clonotype read counts",
+         subtitle = paste0("n=",length(unique(bin_frequency_tmp$sampleid))),
+         fill=gsub("_gsva","",gsub("IHC_","",var)))
+  
+  # not in figures : prefer comapre ratio than absolute count (in stat)
+  # ggsave(plot = p,
+  #        filename = paste0(res_folder,"MiXCR_RNAseq_ClonotypeCounts_IGH_BinCounts_AbsoluteCounts_AllSamples_compare_",var,".pdf"),
+  #        height = 4,width = 8)
+  # 
+  
+  ### Statistical comparisons : boxplot //// Proportion
+  p<-ggplot(bin_frequency_tmp,aes(x =bin_count,y= proportion,fill=variable))+
+    geom_boxplot(outlier.size = 0.5,outlier.colour = "grey")+
+    geom_point(size=0.5,position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75))+
+    scale_fill_manual(values = ColorPal[[var]])+
+    # scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+    # facet_grid(.~sample_type,scales = "free_x",space = "free_x")+
+    stat_compare_means(label = "p.signif")+
+    theme_minimal()+
+    # theme(legend.position = "none")+
+    labs(y="Ratio of occupied IGH repertoire",title = "Bin IGH clonotype read counts",
+         subtitle = paste0("n=",length(unique(bin_frequency_tmp$sampleid))),
+         fill=gsub("_gsva","",gsub("IHC_","",var)))
+  
+  
+  ###### FIGURE 1G (if var == CXCL13)
+  ggsave(plot = p,
+         filename = paste0(res_folder,"Figure1G_MiXCR_RNAseq_ClonotypeCounts_IGH_BinCounts_RatioOfCounts_AllSamples_compare_",var,".pdf"),
+         height = 4,width = 8)
+
+}
+    
+
+
+
+###########################################################################
+# Same but for IGH ISOTYPES - Figure S5B (isotypes - to combine with same plot for total IGH, above)
+###########################################################################
+### binning the clone counts into the bins [1], [2, 3], [4, 10], [11, 30], [31, 100], and [101, MAX]
+
+### binning the clone count/ Do not rename object to avoid error in copy/paste
+bin_frequency <- clone_frequency
+
+## relevel isotypes
+bin_frequency$isotype<-as.character(bin_frequency$isotype)
+bin_frequency$isotype<-ifelse(bin_frequency$isotype=="",
+                              yes = "IGH_NA",
+                              no = bin_frequency$isotype)
+bin_frequency$isotype<-factor(bin_frequency$isotype,
+                              levels = c("IGHM",   "IGHD"  ,
+                                         "IGHG3",  "IGHG1" , "IGHA1" ,"IGHGP",
+                                         "IGHG2",  "IGHG4",  "IGHE",   "IGHA2",
+                                         "IGH_NA"))
+  
+### count per isotype  
+bin_frequency<-tapply(bin_frequency$cloneCount,bin_frequency[,c("sampleid","isotype")],function(freq_sample){
+    bin_1<-sum(freq_sample[freq_sample==1])
+    bin_2_3<-sum(freq_sample[freq_sample>1 & freq_sample<=3])
+    bin_4_10<-sum(freq_sample[freq_sample>3 & freq_sample<=10])
+    bin_11_30<-sum(freq_sample[freq_sample>10 & freq_sample<=30])
+    bin_31_100<-sum(freq_sample[freq_sample>31 & freq_sample<=100])
+    bin_101_Max<-sum(freq_sample[freq_sample>100])
+    mat<-as.matrix(c("1"=bin_1,
+                     "2-3"=bin_2_3,
+                     "4-10"=bin_4_10,
+                     "11-30"=bin_11_30,
+                     "31-100"=bin_31_100,
+                     "101-MAX"=bin_101_Max))
+    colnames(mat)<-"Count"
+    # mat<-data.frame(mat)
+    return(mat)
+})
+
+## convert in a list
+all_comb <- paste(rep(rownames(bin_frequency),each=length(colnames(bin_frequency))),
+                  rep(colnames(bin_frequency),times=length(rownames(bin_frequency))),
+                  sep = "-")
+all_comb<-setNames(all_comb,all_comb)
+bin_frequency <- lapply(strsplit(all_comb,split = "-"),function(comb){
+  mat<-bin_frequency[comb[1],comb[2]]
+})
+
+
+bin_frequency<-lapply(names(bin_frequency),function(nam){
+  mat<-bin_frequency[[nam]][[1]]
+  if(is.null(mat)){
+    mat<-(bin_frequency[["LRHX10-IGHM"]])[[1]] # take one result and replace with 0
+    mat[,"Count"] <-0
+  }
+  colnames(mat)<-nam
+  mat
+})
+bin_frequency<-Reduce(cbind,bin_frequency)
+bin_frequency<-as.data.frame(bin_frequency)
+
+bin_frequency$bin_count <-rownames(bin_frequency)
+bin_frequency$bin_count <- factor(bin_frequency$bin_count,
+                                  levels = rev(c("1","2-3","4-10","11-30","31-100","101-MAX")))
+
+
+bin_frequency<-reshape::melt.data.frame(bin_frequency,id.vars = "bin_count")
+
+# extract back sample id and isotypes from variable
+bin_frequency$sampleid <- sapply(strsplit(as.character(bin_frequency$variable),split = "-"),function(splited)splited[[1]])
+
+bin_frequency$isotype <- sapply(strsplit(as.character(bin_frequency$variable),split = "-"),function(splited)splited[[2]])
+bin_frequency$isotype <- factor(bin_frequency$isotype,
+                                levels = c("IGHM",   "IGHD"  ,
+                                         "IGHG3",  "IGHG1" , "IGHA1" ,"IGHGP",
+                                         "IGHG2",  "IGHG4",  "IGHE",   "IGHA2",
+                                         "IGH_NA"))
+
+#### ADD PROPORTION
+##### compute sum of reads per sample > total IGH
+total_igh_sample <- tapply(bin_frequency$value,bin_frequency$sampleid,sum)
+##### compute proportion of IGH in each group to total IGH
+bin_frequency$proportion <- bin_frequency$value / (total_igh_sample[bin_frequency$sampleid])
+
+###### NB check that sum by patient should be 1
+checktot<-tapply(bin_frequency$proportion,bin_frequency$sampleid,sum) # ok
+
+# merge with metadata
+bin_frequency<-merge(bin_frequency,meta_to_merge_back,by="sampleid")
+
+
+# first lvl : iterate on variable // Save also plot in list to make a patchwork
+plot_list<-list()
+##### iterate on each variable
+for(var in ALLvariable){
+  # subset on patient non NA for the variable
+  bin_frequency_tmp<-bin_frequency
+  bin_frequency_tmp$variable<-bin_frequency_tmp[,var]
+  ## subset only non NA patients for the variable considered
+  bin_frequency_tmp<-bin_frequency_tmp[!is.na(bin_frequency_tmp$variable),]
+  
+  # second lvl : iterate on isotype // Save also plot in list to make a patchwork
+  plot_list_iso <- list()
+  for(iso in levels(bin_frequency$isotype)){
+    #### sub isotype
+    bin_frequency_iso<-bin_frequency_tmp[bin_frequency_tmp$isotype %in% iso,]
+   
+    ## Order by continuous variable the Stacked barplot
+    ### if it's RNAseq/density/TLS-positive : one var
+    ### else if it's TLS mature : order by TLS total and by TLS maturity
+    if(var %in% c("IHC_TLSpositive","IHC_matureTLSpositive")){
+      #retrieve New_TLS_Total_Nb +/- New_TLS_mature_Nb
+      #sort according to TLS+/- mature TLS
+      if(var == "IHC_TLSpositive"){
+        sort_id <- setNames(Bionikk_metadata[,"New_TLS_Total_Nb"],
+                        nm = Bionikk_metadata[,"Anonym_ID"])
+        sort_id <- na.omit(sort_id) # remove NA
+        sort_id <- sort_id[names(sort_id) %in% unique(bin_frequency_iso$sampleid)] # remove sample not present in final table (no IGH)
+        sort_id<-sort(sort_id) # increasing / not decreasing ... weird reading
+        sort_id <-names(sort_id)
+      }else{
+        sort_idTLSmat <- Bionikk_metadata[,c("Anonym_ID",
+                                             "New_TLS_Total_Nb",
+                                             "New_TLS_mature_Nb")]
+        rownames(sort_idTLSmat)<-sort_idTLSmat$Anonym_ID
+        sort_idTLSmat <- na.omit(sort_idTLSmat) # remove NA
+        sort_idTLSmat <- sort_idTLSmat[rownames(sort_idTLSmat) %in% unique(bin_frequency_iso$sampleid),] # remove sample not present in final table (no IGH)
+        sort_id<-rownames(sort_idTLSmat)[order(sort_idTLSmat$New_TLS_mature_Nb,sort_idTLSmat$New_TLS_Total_Nb)] # increasing / not decreasing ... weird reading
+      }
+  
+    }else{
+      sort_id <- setNames(Bionikk_metadata[,gsub("IHC_","New_",var)],
+                        nm = Bionikk_metadata[,"Anonym_ID"])
+      sort_id <- na.omit(sort_id) # remove NA
+      sort_id <- sort_id[names(sort_id) %in% unique(bin_frequency_iso$sampleid)] # remove sample not present in final table (no IGH)
+      sort_id<-sort(sort_id) # increasing / not decreasing ... weird reading
+      sort_id <-names(sort_id)
+    }
+    
+    bin_frequency_iso$sampleid <- factor(as.character(bin_frequency_iso$sampleid),
+                                      levels =sort_id )
+    
+    # First plot absolute count
+    p_abs<-ggplot(bin_frequency_iso,aes(x =sampleid,y= value))+
+      geom_col(mapping = aes(fill=bin_count),color="black",position = "stack") +  # <- stack barplot
+      # geom_text(data = bin_frequency_label,mapping = aes(label=R_NR),size=3,angle=90,hjust=-0.2)+
+      # facet_grid(~sample_type,scales = "free_x",space = "free_x")+
+      theme_minimal()+
+      scale_fill_manual(values = RColorBrewer::brewer.pal(length(levels(bin_frequency_iso$bin_count)),"Spectral"))+
+      labs(y=paste(iso,"clonotypes\ntotal counts"),
+           title = paste(iso,"clonotype read counts"),
+           subtitle = paste(paste0("n=",length(unique(bin_frequency_iso$sampleid))),
+           paste("sorted left to right according to",gsub("_gsva","",gsub("IHC_","",var)))),
+           fill="Clonotype count\ncategories",x=NULL)+
+      # theme(axis.text.x = element_text(angle=45, hjust = 1,size=7))+
+      theme(axis.text.x = element_blank())
+    
+    
+    # Second plot proportion of count
+    p_prop<-ggplot(bin_frequency_iso,aes(x =sampleid,y= proportion))+
+      geom_col(mapping = aes(fill=bin_count),color="black",position = "stack") +  # <- stack barplot
+      # geom_text(data = bin_frequency_label,mapping = aes(label=R_NR),size=3,angle=90,hjust=-0.2)+
+      # facet_grid(~sample_type,scales = "free_x",space = "free_x")+
+      theme_minimal()+
+      scale_fill_manual(values = RColorBrewer::brewer.pal(length(levels(bin_frequency_iso$bin_count)),"Spectral"))+
+      labs(y=paste(iso,"ratio"),
+           # title = "Bin IGH clonotype read counts",
+           # subtitle = paste(paste0("n=",length(unique(bin_frequency_iso$sampleid))),
+           # paste("sorted left to right according to",gsub("_gsva","",gsub("IHC_","",var)))),
+           fill="Clonotype count\ncategories",x=NULL)+
+      theme(axis.text.x = element_text(angle=45, hjust = 1,size=7))
+    
+    
+    #patchwork of absolute count and proportion
+    p<-(p_abs/p_prop)+plot_layout(guides = "collect")
+    
+    # Not in final paper
+    # ggsave(plot = p,
+    #        filename = paste0(res_folder,"MiXCR_RNAseq_ClonotypeCounts_IGH_BinCounts_BarplotStacked_AllSamples_compare_",var,"_ISOTYPES_",iso,".pdf"),
+    #        height = 5,width = 10)
+  
+    #############
+    # Save plot for patchwork later
+    plot_list_iso[[iso]]<-list(bar_abs=p_abs,
+                               bar_prop=p_prop,
+                               bar_all=p)
+    #############
+    
+    ### Statistical comparisons : boxplot
+    ##### Reverse order of level to have from left to right an increase of Count ...
+    bin_frequency_iso$bin_count<-factor(as.character(bin_frequency_iso$bin_count),
+                                        levels =rev(levels(bin_frequency_iso$bin_count)) )
+    p<-ggplot(bin_frequency_iso,aes(x =bin_count,y= value+1,fill=variable))+
+      geom_boxplot(outlier.size = 0.5,outlier.colour = "grey")+
+      geom_point(size=0.5,position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75))+
+      scale_fill_manual(values = ColorPal[[var]])+
+      scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+      # facet_grid(.~sample_type,scales = "free_x",space = "free_x")+
+      stat_compare_means(label = "p.signif")+
+      theme_minimal()+
+      # theme(legend.position = "none")+
+      labs(y=paste(iso,"clonotypes\ntotal counts"),
+           title = paste(iso,"clonotype read counts"),
+           subtitle = paste0("n=",length(unique(bin_frequency_iso$sampleid))),
+           fill=gsub("_gsva","",gsub("IHC_","",var)))
+    
+    # not in final paper
+    # ggsave(plot = p,
+    #        filename = paste0(res_folder,"MiXCR_RNAseq_ClonotypeCounts_IGH_BinCounts_AbsoluteCounts_AllSamples_compare_",var,"_ISOTYPES_",iso,".pdf"),
+    #        height = 4,width = 8)
+    
+    plot_list_iso[[iso]]$stat_abs <- p
+    
+    ### Statistical comparisons : boxplot //// Proportion
+    p<-ggplot(bin_frequency_iso,aes(x =bin_count,y= proportion,fill=variable))+
+      geom_boxplot(outlier.size = 0.5,outlier.colour = "grey")+
+      geom_point(size=0.5,position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75))+
+      scale_fill_manual(values = ColorPal[[var]])+
+      # scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+      # facet_grid(.~sample_type,scales = "free_x",space = "free_x")+
+      stat_compare_means(label = "p.signif")+
+      theme_minimal()+
+      scale_y_continuous(expand = expansion(mult = 0.2))+
+      # theme(legend.position = "none")+
+      labs(y=paste(iso,"ratio"),
+           x="Clonotype count categories",
+           # title = paste(iso,"clonotype read counts"),
+           # subtitle = paste0("n=",length(unique(bin_frequency_iso$sampleid))),
+           fill=gsub("_gsva","",gsub("IHC_","",var)))
+    
+    # not in final paper alone >> but is part of supplementary 5B as a patchwork (see later)
+    # ggsave(plot = p,
+    #        filename = paste0(res_folder,"MiXCR_RNAseq_ClonotypeCounts_IGH_BinCounts_RatioOfCounts_AllSamples_compare_",var,"_ISOTYPES_",iso,".pdf"),
+    #        height = 4,width = 8)
+    
+    plot_list_iso[[iso]]$stat_prop <- p
+    
+  } # end isotype loop
+plot_list[[var]] <- plot_list_iso
+
+# create patchork of all iso per variable
+patch_stat_ratio <- lapply(plot_list_iso,function(plotss)plotss[["stat_prop"]])
+patch_stat_ratio <- patchwork::wrap_plots(patch_stat_ratio,guides="collect",axes="collect",ncol=1)
+
+
+# Figure S5B if var == mature TLS categories (NB : to combine with the same plot but only for IGH total, above)
+
+ggsave(plot = patch_stat_ratio,
+           filename = paste0(res_folder,"S5B_MiXCR_RNAseq_ClonotypeCounts_IGH_BinCounts_RatioOfCounts_AllSamples_compare_",var,"_ISOTYPES_","ALLisoPatchork",".pdf"),
+           height = 15,width = 8)
+
+} # end variable loop
+
+
+```
+
+**Figure 1F**
+
+```{r,fig.height=5,fig.width=10}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure1F_MiXCR_RNAseq_ClonotypeCounts_IGH_BinCounts_BarplotStacked_AllSamples_compare_Petitprez_CXCL13_gsva.pdf"),density = 300)
+plot(img)
+```
+
+**Figure 1G**
+
+```{r,fig.height=4,fig.width=8}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure1G_MiXCR_RNAseq_ClonotypeCounts_IGH_BinCounts_RatioOfCounts_AllSamples_compare_Petitprez_CXCL13_gsva.pdf"),density = 300)
+plot(img)
+```
+
+**Figure S5B**
+
+```{r,fig.height=15,fig.width=8}
+img <- magick::image_read_pdf(paste0(res_folder,"S5B_MiXCR_RNAseq_ClonotypeCounts_IGH_BinCounts_RatioOfCounts_AllSamples_compare_IHC_matureTLSpositive_ISOTYPES_ALLisoPatchork.pdf"),density = 300)
+plot(img)
+```
+
+## Figure 1H - Experimental scheme (biorender)
+
+**Figure 1H**
+
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"1H_to_render_compressed.pdf"),density = 300)
+plot(img)
+```
+
+## Figures 1I, 1J, 1K - Multiple isotype (intra-tumoral CSR)
+
+The goal is to see if some specific IGH clonotypes can be found in multiple isotype in the same patients.
+
+```{r}
+# Search same V-cdr3-J (gene) across IGH isotypes / remove IGH_NA and IGHGP
+
+######## IGH isotype clonotypes computing function
+# Function : Focus on IGH clonotype and search for multiple isotype in the same patient. 
+## the clonotype is defined based on same CDR3aa sequence and V-J genes
+
+  #subset IGH clonotype 
+  ClonotypeDf <- clonotype_bulk_muts_bionikk[clonotype_bulk_muts_bionikk$type %in% "IGH",]
+  
+  ## create a concatenated v-cdr3aa-j col to define unique clonotype
+#### Need to recompute best_V because of this "best_V <- factor(best_V,levels=rev(names(sort(table(best_V),decreasing = T))))" it was converted as factor, which do not raise issue for paste in "gene_used" column but render the level (1) rather than the gene in the return. 
+  ClonotypeDf$v_cdr3aa_j <- paste(gsub("\\*.*","",ClonotypeDf$allVHitsWithScore),
+                                  ClonotypeDf$nSeqImputedCDR3,  
+                                  ClonotypeDf$best_J,
+                                  sep = "_")
+  
+  ####  v_cdr3_j dupli : table(duplicated(ClonotypeDf$v_cdr3aa_j)) 
+  ##### only CDR3 dupli: table(duplicated(ClonotypeDf$nSeqImputedCDR3))
+  #### Check CDR3 dupli : 
+  ####### checkdup <-unique(ClonotypeDf$nSeqImputedCDR3[duplicated(ClonotypeDf$nSeqImputedCDR3)])
+  ####### checkdup<-ClonotypeDf[ClonotypeDf$nSeqImputedCDR3 %in% checkdup,]
+  ####### checkdup<-checkdup[order(checkdup$nSeqImputedCDR3),]
+  ### CCl° : The same CDR3 can have different Vgene but seems to be really close and the difference more due to fragmented reads  and inputation rather than different V alignment. The J gene seems more consistent (CDR3-J) Choose to simplify by consider only nseqCDR3 duplicated regarding the quality of data ...
+  
+  ## split by sampleid and iterate on each sub_repertoire / sampleid
+  ClonotypeDf <- split(ClonotypeDf,ClonotypeDf$sampleid)
+  
+IGH_CSR <- lapply(ClonotypeDf,function(ClonotypeDf_id){
+    # retrieve list of unique nSeqImputedCDR3 in the sample
+    DuplicatedClono <- unique(ClonotypeDf_id$nSeqImputedCDR3[duplicated(ClonotypeDf_id$nSeqImputedCDR3)])
+    DuplicatedClono<-setNames(DuplicatedClono,DuplicatedClono)
+    
+    ## get the list of unique IGH isotype for each duplicated clonotypes.
+    res_dupli <- lapply(DuplicatedClono,function(clon){
+        ## get the list of isotypes for all the duplicated CDR3 seq 
+        tmp <- ClonotypeDf_id[ClonotypeDf_id$nSeqImputedCDR3 == clon,]
+        ListIsotype <-tmp$isotype 
+        ListIsotype <-unique(ListIsotype) ## the same isotype can be found duplicated ... Remove it by unique
+        ListIsotype <- ListIsotype[ListIsotype!=""] # if the isotype was not infered, it is written as "" > remove it
+        
+  ## Reorder the isotypes for each IGH clonotypes according to the order of class-switch
+  ## the order of constant genes on the genome : c("IGHM","IGHD","IGHG3","IGHG1","IGHA1","IGHG2","IGHG4","IGHE","IGHA2")
+        IGHisoOnGenome <-setdiff(OrderIso,"IGH_NA")
+        ListIsotype <- IGHisoOnGenome[IGHisoOnGenome %in% ListIsotype]
+        ListIsotype<-paste(ListIsotype,collapse = "_")
+        
+    return(data.frame(clonotype=clon,
+                      Isotypes=ListIsotype))  
+    })
+    Reduce(rbind,res_dupli) # merge in a global data.frame
+})
+
+##  Reduce sampleid and remove
+IGH_CSR<-IGH_CSR[!sapply(IGH_CSR,is.null)] # remove sample without any duplicated clonotype / no result
+IGH_CSR <- lapply(names(IGH_CSR),function(id){
+  tmp<-IGH_CSR[[id]]
+  tmp$sampleid<-id
+  tmp
+})
+IGH_CSR <- Reduce(rbind,IGH_CSR) 
+
+## remove duplicated clonotype with only 1 isotype > no CSR (rather SHM)
+IGH_CSR<-IGH_CSR[grepl("_",IGH_CSR$Isotypes),] # if there is a "_" in isotypes, then there is at least 2
+
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## 
+## First Count intra-tumoral CSR / patients vs TLS
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## 
+# count per patient with at least 1 CSR intra tumor
+Nb_CSR_id <- table(sampleid=IGH_CSR$sampleid)
+Nb_CSR_id<-data.frame(Nb_CSR_id)
+
+# Merge with TLS rnaseq/ihc > rnaseq/ihc first to get all patients. Convert NA as for Freq (Nb CSR observed)
+### Merge with score TLS in metadata
+###########################################################################
+# Merge with high/low RNAseq variables / TLS density / TLS IHC category
+## high low RNAseq variables
+# variable of metadata to iterate on
+var_TLS_rna<-grep("gsva",colnames(Bionikk_metadata),value = T)
+# retrive gsva score from bionikk_metadata
+TLSsignScores <-Bionikk_metadata[,c("Anonym_ID",var_TLS_rna)]
+rownames(TLSsignScores)<-TLSsignScores$Anonym_ID
+TLSsignScores<-TLSsignScores[,setdiff(colnames(TLSsignScores),"Anonym_ID")]
+TLSsignScores<-apply(TLSsignScores,2,function(scores){
+    #define threshold
+    thresh_tlspos <- quantile(scores,probs = 0.5) #Threshold = median in the all cohort
+    scores_hl <- ifelse(scores > thresh_tlspos,"high","low")
+})
+TLSsignScores<-as.data.frame(TLSsignScores)
+TLSsignScores$sampleid<-rownames(TLSsignScores)
+
+## high low TLS density / ## TLS category
+# variable of metadata to iterate on
+var_TLS_ihc<-c(grep("New_TLS",colnames(Bionikk_metadata),value = T),
+                            "New_matureTLSpositive")
+var_TLS_ihc<- c(grep("density",var_TLS_ihc,value = T),grep("posi",var_TLS_ihc,value = T)) # keep only category and density
+
+# retrive tls ihc nb and category from bionikk_metadata
+TLSihc_nb_cat <-Bionikk_metadata[,c("Anonym_ID",var_TLS_ihc)]
+# rename
+var_TLS_ihc<- gsub("New_","IHC_",var_TLS_ihc) # rename new TLS count
+colnames(TLSihc_nb_cat)<-gsub("New_","IHC_",colnames(TLSihc_nb_cat))
+
+# convert density in high low according to median (similar as rnaseq sign)
+# retrive gsva score from bionikk_metadata
+TLSihc_nb_hl <-TLSihc_nb_cat[,c("Anonym_ID","IHC_TLS_Total_density", "IHC_TLS_immature_density", "IHC_TLS_mature_density")]
+rownames(TLSihc_nb_hl)<-TLSihc_nb_hl$Anonym_ID
+TLSihc_nb_hl<-TLSihc_nb_hl[,setdiff(colnames(TLSihc_nb_hl),"Anonym_ID")]
+TLSihc_nb_hl<-apply(TLSihc_nb_hl,2,function(scores){
+    #define threshold
+    thresh_tlspos <- quantile(na.omit(scores),probs = 0.5) #Threshold = median in the all cohort
+    scores_hl <- ifelse(scores > thresh_tlspos,"high","low")
+})
+TLSihc_nb_hl<-as.data.frame(TLSihc_nb_hl)
+TLSihc_nb_hl$sampleid<-rownames(TLSihc_nb_hl)
+
+## merge scores and TLS ihc
+TLSsignScores<-merge(TLSsignScores,TLSihc_nb_hl,by="sampleid",all.x=T)
+TLSsignScores<-merge(TLSsignScores,TLSihc_nb_cat[,c("Anonym_ID","IHC_TLSpositive","IHC_matureTLSpositive")],by.x="sampleid",by.y="Anonym_ID",all.x=T)
+colnames(TLSsignScores)<-gsub("IHC_","",gsub("_gsva","",colnames(TLSsignScores)))
+
+####### ALL VARIABLE TO ITERATE AND PALETTE
+var_TLS_rna<-gsub("_gsva","",var_TLS_rna)
+var_TLS_ihc<-gsub("IHC_","",var_TLS_ihc)
+ALLvariable <-c(var_TLS_rna,var_TLS_ihc)
+ColorPal <- rep(list(c("low"="#F16913",
+                   "high"="#74C476" )),times=length(var_TLS_rna)+length(grep("density",var_TLS_ihc,value = T)))
+names(ColorPal)<-c(var_TLS_rna,grep("density",var_TLS_ihc,value = T))
+ColorPal$TLSpositive<-c("TLStot=0"="#F16913",
+                   "TLStot>0"="#74C476" )
+ColorPal$matureTLSpositive<-c(`TLS-negative`="#F16913",
+                   `TLS-immature-only`="#6A3D9A",
+                   `TLS-mature>0`="#36AAF9FF" )
+## as factor with correct level order
+for(var in var_TLS_rna){
+  TLSsignScores[,var]<-factor(TLSsignScores[,var],levels = c("low","high"))
+}
+
+for(var in grep("density",var_TLS_ihc,value = T)){
+  TLSsignScores[,var]<-factor(TLSsignScores[,var],levels = c("low","high"))
+}
+
+TLSsignScores$TLSpositive<-factor(TLSsignScores$TLSpositive,
+                                        levels = c("TLStot=0" ,"TLStot>0"))
+
+TLSsignScores$matureTLSpositive<-factor(TLSsignScores$matureTLSpositive,
+                                        levels = c("TLS-negative" ,"TLS-immature-only" , "TLS-mature>0" ))
+
+###########################################################################
+## Merge with NbCSR
+Nb_CSR_id <- merge(TLSsignScores,Nb_CSR_id,by="sampleid",all.x=T)
+Nb_CSR_id$Freq[is.na(Nb_CSR_id$Freq)]<-0 # No CSR observed = 0 count
+
+##### iterate on each variable
+####### optimize on all but only TLS categories are present in the paper
+ALLvariable <- c("Petitprez_CXCL13",  "matureTLSpositive") # comment if all plot wanted
+
+for(var in ALLvariable){
+  # subset on patient non NA for the variable
+  Nb_CSR_id_tmp<-Nb_CSR_id
+  Nb_CSR_id_tmp$variable<-Nb_CSR_id_tmp[,var]
+  ## subset only non NA patients for the variable considered
+  Nb_CSR_id_tmp<-Nb_CSR_id_tmp[!is.na(Nb_CSR_id_tmp$variable),]
+  
+  ### Statistical comparisons : boxplot
+  p<-ggplot(Nb_CSR_id_tmp,aes(x =variable,y= Freq+1,fill=variable))+
+    geom_violin()+
+    geom_boxplot(fill="white",outlier.size = 0.5,outlier.colour = "grey",width=0.1)+
+    geom_point(size=0.5)+
+    scale_fill_manual(values = ColorPal[[var]])+
+    scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+    theme_minimal()+
+    theme(legend.position = "none")+
+    labs(y="Nb IGH (nCDR3) with multiple isotype +1",
+         subtitle = paste0("n=",length(unique(Nb_CSR_id_tmp$sampleid))),
+         fill=var,
+         x=var)
+  
+  ### add stat > first kruskal wallis for matureTLSpositive (3 levels)
+  ###### else firectly add wilcoxon
+  if(var=="matureTLSpositive"){
+      # Re compute kruskall wallis test. If not significant, then plot it
+      kruskallRes<-compare_means(Freq~variable,data=Nb_CSR_id_tmp,method ="kruskal.test")
+      # else plot the Dunn test res without kruskall test
+      if(kruskallRes$p<0.05){
+        # compute dunn test
+        dunnRes <- dunn.test::dunn.test(x = Nb_CSR_id_tmp[,"Freq"],g = Nb_CSR_id_tmp[,"variable"],method = "bh",kw = T,altp = T)
+        comparisons_tmp <- dunnRes$comparisons
+        comparisons_tmp <- strsplit(comparisons_tmp," - ")
+        adjp_dunn_tmp <- format(dunnRes$`altP.adjusted`,digits = 2,trim = T)
+        to_bold_tmp <- ifelse(as.numeric(adjp_dunn_tmp) < 0.05, paste( "*"),"ns")
+
+        p <- p+
+              ggsignif::geom_signif(annotations = adjp_dunn_tmp ,parse = F, comparisons = comparisons_tmp, step_increase = 0.1)+
+          labs(y="Nb IGH (nCDR3) with multiple isotype +1",
+         title = paste0("n=",length(unique(Nb_CSR_id_tmp$sampleid))),
+         subtitle=paste("Kruskal-Wallis p-value =",kruskallRes$p.format),
+         fill=var,
+         x=var)
+          
+      }else{
+          p <- p+
+              stat_compare_means(method ="kruskal.test")
+      }
+    
+  }else{
+    p<-p+
+      stat_compare_means()
+  }
+  
+  
+  wdt<-ifelse(length(levels(Nb_CSR_id_tmp$variable))==2,yes = 3,no = 5)  # width of plot according to Nb of Lvl
+  
+  # Figure 1I and 1J depending on the variable
+  ggsave(plot = p,
+         filename = paste0(res_folder,"Figure1IJ_MiXCR_RNAseq_IGHmultipleIso_Nb_AllSamples_compare_",var,".pdf"),
+         height = 4,width = wdt)
+}  
+
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## 
+## Then characterize type of CSR : heatmap
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## 
+
+# NB one CDR3 found in 2 patients. Fuse clonotype with sample id to have unique id ...
+IGH_CSR_hm<-IGH_CSR
+IGH_CSR_hm$clonotype<-paste(IGH_CSR_hm$clonotype,IGH_CSR_hm$sampleid,sep = "_")
+
+# fill a matrix of Isotypes (rows) x clonotypes (col)
+library(ComplexHeatmap)
+Iso_Mat<-setdiff(OrderIso,"IGH_NA") # order of iso rows in heatmap
+MatrixHeatmap<-matrix(0,
+                      nrow=length(Iso_Mat),
+                      ncol = length((IGH_CSR_hm$clonotype)))
+rownames(MatrixHeatmap)<-Iso_Mat
+colnames(MatrixHeatmap)<-IGH_CSR_hm$clonotype
+
+for(clon in IGH_CSR_hm$clonotype){
+  ## retreive positive isotypes
+  pos_iso<-IGH_CSR_hm[IGH_CSR_hm$clonotype==clon,"Isotypes"]
+  ## split
+  pos_iso<- unlist(strsplit(pos_iso,split = "_"))
+  ## Fill with a 1 if the isotype was found
+  MatrixHeatmap[pos_iso,clon]<-1
+}
+
+# split heatmap by ID
+  Spliter <- factor(gsub(".*_","",colnames(MatrixHeatmap)))
+  
+  hm<-ComplexHeatmap::Heatmap(matrix = (MatrixHeatmap), 
+                        cluster_rows = F, # to avoid kmeans clustering
+                        cluster_columns = T,# 
+                        name = "IGH isotype", # Name of the matrix legend
+                        column_title = paste("IGH clonotypes (nCDR3) with multiple isotypes - BioniKK (n=",length(levels(Spliter)),")",sep = ""), # To set the title of the heatmap
+                        column_title_gp = gpar( fontface = "bold"), # To make the title in bold
+                         # row_title_gp =gpar(fontface = "bold", fontsize = 10), # To reduce the size of the title
+                        col = structure(1:2,names=c("0","1")),# color of the discrete matrix (categorical variable)
+                        na_col = "bisque4", #NA color
+                        column_split =Spliter,
+                        border = TRUE,
+                        show_column_names = FALSE) #hide row_names
+  hm<-draw(hm)
+
+  ### DONT SAVE THE INTERMEDIATE HEATMAP (just used to cluster column)
+  # pdf(file = paste0(res_folder,"20251022_Repertoire_bulkRNAseq/IGH_multipleIso/","MiXCR_RNAseq_IGHmultipleIso_Heatmap_Isotypes_0_1_forClustering.pdf"),
+  #     width =8 ,height =4 )
+  #     hm
+  # dev.off()
+
+#Get the order of the clustering on the heatmap with 0 and 1
+  ColumnOrder <- column_order(hm)
+  ColumnOrder <- Reduce(c,ColumnOrder)
+
+#Create Categorical Matrix
+#0 > NoClon
+# OnlyG / OnlyA ... (by Row)
+
+  MatrixHeatmap_cat<-MatrixHeatmap
+  MatrixHeatmap_cat[MatrixHeatmap_cat==0] <- "NA"
+
+  for(clon in colnames(MatrixHeatmap_cat)){
+    tmp <- MatrixHeatmap_cat[,clon]
+    Isotypes <- names(tmp[tmp != "NA"])
+    IsoLetter <- substr(Isotypes,4,4)
+    if(all(IsoLetter=="G")){
+      MatrixHeatmap_cat[Isotypes,clon] <- "Only_G"
+    }else if(all(IsoLetter=="A")){
+      MatrixHeatmap_cat[Isotypes,clon] <- "Only_A"
+    }else{
+      if(any(IsoLetter=="M"|IsoLetter=="D")){
+        MatrixHeatmap_cat[Isotypes,clon] <- "Unswitched_&_Switched"
+      }else{
+        if(all(IsoLetter=="G"|IsoLetter=="A")){
+          MatrixHeatmap_cat[Isotypes,clon] <- "G_&_A"
+        }else if(all(IsoLetter=="G"|IsoLetter=="E")){
+          MatrixHeatmap_cat[Isotypes,clon] <- "G_&_E"
+        }
+      }
+    }
+  }
+  
+  # order according to clustering
+  MatrixHeatmap_cat <- MatrixHeatmap_cat[,ColumnOrder]
+  
+  #Adapt split
+  Spliter<-factor(gsub(".*_","",colnames(MatrixHeatmap_cat)),
+                  levels =unique(gsub(".*_","",colnames(MatrixHeatmap_cat))))
+
+  # get level in matrix
+  LevelsInMatrix <- unique(c(MatrixHeatmap_cat))
+  
+  #Order the levels of category in the same way every time
+  LevelsInHeatmap <- c("NA","G_&_A","G_&_E","Only_A","Only_G","Unswitched_&_Switched")[c("NA","G_&_A","G_&_E","Only_A","Only_G","Unswitched_&_Switched") %in% LevelsInMatrix]
+  
+  HeatmapIGHiso <- ComplexHeatmap::Heatmap(matrix = MatrixHeatmap_cat, # The scaled and transposed matrix
+                        cluster_rows = F, # to avoid kmeans clustering
+                        cluster_columns = F,# to avoid kmeans clustering
+                        # rect_gp = gpar(col = "grey60", lwd = 1),# to add a grid in the matrix which will be grey (same color as in pheatmap)
+                        show_heatmap_legend = FALSE, # customized legend
+                        name = "IGH isotype", # Name of the matrix legend
+                        column_title = paste("IGH clonotypes (nCDR3) with multiple isotypes - BioniKK (n=",length(levels(Spliter)),")",sep = ""), # To set the title of the heatmap
+                        column_title_gp = gpar( fontface = "bold"), # To make the title in bold
+                         # row_title_gp =gpar(fontface = "bold", fontsize = 10), # To reduce the size of the title
+                        col = structure(1:length(LevelsInHeatmap),names=LevelsInHeatmap),# color of the discrete matrix (categorical variable)
+                        na_col = "bisque4", #NA color
+                        column_split =Spliter,
+                        border = TRUE,
+                        show_column_names = FALSE) #hide row_names
+
+  #Change colors according to previous barplot (ggplot number in TLSpos vs TLSneg)
+  ##Get the color of the ggplot (stack overflow :https://stackoverflow.com/questions/8197559/emulate-ggplot2-default-color-palette)
+  gg_color_hue <- function(n) {
+    hues = seq(15, 375, length = n + 1)
+    hcl(h = hues, l = 65, c = 100)[1:n]
+  }
+  ##plot(1:5, pch = 16, cex = 2, col = gg_color_hue())
+  NewCol <- c("#000000FF",gg_color_hue(length(LevelsInHeatmap)-1))
+  names(NewCol) <-names(HeatmapIGHiso@matrix_color_mapping@colors)
+  HeatmapIGHiso@matrix_color_mapping@colors <- NewCol
+  HeatmapIGHiso@matrix_color_mapping@full_col <- NewCol
+  
+  #Legend horizontaly
+  lgd = Legend(labels = names(NewCol), legend_gp = gpar(fill = NewCol), title = "IGH isotype", nrow = 1, title_position = "leftcenter")
+  
+  # final heatmap draw
+  cat_hm <-draw(HeatmapIGHiso,annotation_legend_list= lgd,annotation_legend_side = "bottom")
+  
+  ### SAVE THE FINAL HEATMAP - Figure 1K
+  pdf(file = paste0(res_folder,"Figure1K_MiXCR_RNAseq_IGHmultipleIso_Heatmap_Isotypes_WithCategories.pdf"),
+      width =8 ,height =4 )
+      cat_hm
+  dev.off()
+
+  
+### Finally table the nb of clonotypes with multiple isotype per category
+  list(total_CSR=nrow(IGH_CSR))
+  sort(table(apply(MatrixHeatmap_cat,2,function(cat)unique(cat)[unique(cat) != "NA"])),decreasing = T)
+```
+
+**Figure 1I**
+
+```{r,fig.height=4,fig.width=3}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure1IJ_MiXCR_RNAseq_IGHmultipleIso_Nb_AllSamples_compare_Petitprez_CXCL13.pdf"),density = 300)
+plot(img)
+```
+
+**Figure 1J**
+
+```{r,fig.height=4,fig.width=5}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure1IJ_MiXCR_RNAseq_IGHmultipleIso_Nb_AllSamples_compare_matureTLSpositive.pdf"),density = 300)
+plot(img)
+```
+
+**Figure 1K**
+
+```{r,fig.height=4,fig.width=8}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure1K_MiXCR_RNAseq_IGHmultipleIso_Heatmap_Isotypes_WithCategories.pdf"),density = 300)
+plot(img)
+```
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,16 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# macOS
+.DS_Store
+._*
+
+# Temporary files
+*.log
+*.tmp
+
+# Raw and processed data deposited in EGA
+RAWDATA/
+PROCESSED/

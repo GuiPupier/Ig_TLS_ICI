@@ -1,0 +1,622 @@
+---
+title: "Immunoverse Immcantation Clonal analysis - Ig repertoire, IgG and IgA tumor cells and response to ICI"
+author: "Guilhem Pupier"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  rmdformats::readthedown:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+Paired **Tumor**, **PBMC before ICI treatment (T0)** and **after 6 weeks of ICI treatment (T6)**, stored frozen, were processed to extract RNA, generate Immunoverse libraries, and compare the total Ig repertoire between these samples and according to **ICI treatment response (R= responders, NR= non responders)**. A total of 90 paired samples from 30 patients (12NR + 18R) were analyzed together with an additional tumor from a NR patient lacking the paired blood samples, as well as 5 blood samples from **healthy donors (HD)** used as reference.
+
+Paired information of IgG and IgA coverage on tumor cells was available for a subset of 20 patients (60 samples) + 1 tumor only (without PBMC).
+
+Goal :
+
+- To analyze Ig repertoire correlation with IgG/IgA coverage on tumor cells  and response to ICI.  
+
+Sections :
+
+- **Preprocess** :  
+All pre-process steps are aailables in previous script "Figure4".    
+
+- **Reload merged dataset** :  
+Reload data to generate plots.
+
+- **Figures** : 
+Script to reproduce Figure 5 and S11.  
+
+# Load required packages
+
+
+```{r,eval=T}
+library(airr)
+library(alakazam)
+library(shazam) # airr data packages
+
+library(data.table) # function fread() for efficient and fast read of tab file
+
+library(stringi)
+library(stringr) # string manipulations
+
+library(dplyr) 
+library(tidyr)
+library(reshape2) # table manipulations
+
+library(MESS) # compute AUC
+
+library(pastecs)
+library(RColorBrewer)
+library(viridis) # color palettes
+library(patchwork)
+library(ggplot2)
+library(ggpubr)
+library(grid)
+library(gridExtra)
+library(scales) # plot functions
+#from Heather Turner @stackoverflow ## Adapt y scale in log scale 
+base_breaksLog10 <- function(n = 10){
+  function(x) {
+    axisTicks(log10(range(x, na.rm = TRUE)), log = T, n = n)
+  }
+}
+base_breaksLog1p <- function(n = 10){
+  function(x) {
+    axisTicks(log1p(range(x, na.rm = TRUE)), log = T, n = n)
+  }
+}
+
+# library(qs) # optimize (faster than rds) writing and reading of large dataset in R
+
+# plot contingency (fro Maxime Meylan)
+plot_contingency <- function(data,
+           variables = c("TLS_pos", "HBV"),
+           hide_legend = F,
+           text_size=6,
+           text_position_side=T,
+           create_labels = T,
+           inverse_factor2=F,
+           order_factor=NULL,
+           palette = NA,
+           geom_label=F,
+           test_name = c("chisq.test", "fisher.test")[1],
+           labs = c(xlab = "",
+                    ylab = "",
+                    legend_title = ""),
+           hide_test = F,
+           title = ""){
+    if(inverse_factor2){
+      data[,variables[2]] <- factor(data[,variables[2]],levels=rev(levels(data[,variables[2]])))
+    }
+    cont_table <- table(data[,variables[1]],data[,variables[2]])
+    #clean data table to avoid empty rows
+    non_empty_rows <- rowSums(cont_table)!=0
+    cont_table <- cont_table[non_empty_rows,]
+
+    if(create_labels){
+      #sapply(levels(factor(data[,variables[2]])), function(x) paste(variables[2],x,sep="_"))
+      colnames(cont_table) <- sapply(levels(factor(data[,variables[2]])), function(x) paste(variables[2],x,sep="_"))
+      rownames(cont_table) <- sapply(levels(factor(data[,variables[1]])), function(x) paste(variables[1],x,sep="_"))
+    }
+  if(test_name != "fisher.test" & test_name != "chisq.test"){
+    stop("incorrect test, valid options are fisher.test or chisq.test")
+  }
+  if(test_name == "fisher.test"){
+    error_test <-  if(class(try(fisher.test(cont_table),silent=T)) == "try-error"){
+      test_res <- fisher.test(cont_table,simulate.p.value = T)
+    }else{
+      test_res <- fisher.test(cont_table)
+    }
+  }
+  if(test_name == "chisq.test"){
+    test_res <- chisq.test(cont_table)
+  }
+  #make sure there is a matrix (enough values in both sides)
+  if(!is.null(dim(cont_table))){
+    cont_table_perc <-apply(cont_table,1,function(x) {
+      res <- x / sum(x) *100
+    })
+    cont_table_m <- melt(cont_table_perc)
+    cont_table_m$Var1 <- factor(cont_table_m$Var1)
+    p <- ggplot(data=cont_table_m, aes(x=Var2,y=value,fill=Var1,label=value))
+    p <- p + geom_bar(stat="identity",width=0.95)
+    #to reverse order of bars
+    #p <- p + geom_bar(stat="identity",width=0.95,position = position_stack(reverse = TRUE))
+    
+    if(geom_label){
+      if(text_position_side){
+        p <- p + geom_label(color="white",label = paste0(as.vector(t(cont_table))," (",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }else{
+        p <- p + geom_label(color="white",label = paste0(as.vector(t(cont_table)),"\n(",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }
+    }else{
+      if(text_position_side){
+        p <- p + geom_text(label = paste0(as.vector(t(cont_table))," (",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }else{
+        p <- p + geom_text(label = paste0(as.vector(t(cont_table)),"\n(",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }
+    }
+    
+    p <- p + theme_minimal()
+
+    if(any(!is.na(palette))){
+      p <- p + scale_fill_manual(values = palette)
+    }
+    #p <- p + theme(legend.title = element_blank())#,axis.text.x = element_text(angle = 25, hjust = 1))
+    p <- p + guides(fill=guide_legend(title=labs[3]))
+    if(hide_test){
+      p <- p + labs(subtitle=paste("p = ",format(test_res$p.value,digits=3),sep=" "),title=title,x=labs[1],y=labs[2])
+      if(test_res$p.value < 0.05 ) p <- p + theme(plot.subtitle=element_text(face="bold"))
+    }else{
+      p <- p + labs(subtitle=paste(test_name, " p = ",format(test_res$p.value,digits=3),sep=" "),title=title,x=labs[1],y=labs[2])
+      if(test_res$p.value < 0.05 ) p <- p + theme(plot.subtitle=element_text(face="bold"))
+    }
+
+    if(hide_legend){
+      p <- p + guides(fill=FALSE)
+    }
+  }else{
+    p <- ggplot()
+    test_res <-1
+  }
+  return(list(p,test_res,cont_table))
+
+}
+
+# Color palettes for consistency on plot
+##Get the color of the ggplot (stack overflow :https://stackoverflow.com/questions/8197559/emulate-ggplot2-default-color-palette)
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+## palette of R_NR factor
+pal_R_NR_HD <- gg_color_hue(3)
+names(pal_R_NR_HD)<-c("NR","R","HD")
+## palette used for heatmap will be used for all plots
+ColorPal<- list(Arm=c(`Nivo-Ipi`="#6A3D9A",
+                      Nivo="#1F78B4",
+                      TKI="#FFD92F"),
+                R_NR=c(R="#00BA38",
+                           NR="#F8766D",
+                       HD="#619CFF"),
+                sample_storage=c(FFPE="darkgrey",
+                                 Frozen="#E7298A"),
+                sample_type=c(`Tumor.T0`="black",
+                         `PBMC.T0`="#1F78B4",
+                         `PBMC.T6`="#E31A1C",
+                         `Tonsil.T0`="darkgrey"),
+                sample_type2=c(`Tumor.T0`="black",
+                         `PBMC.T0`="#1F78B4",
+                         `PBMC.T6`="#E31A1C",
+                         `PBMC.HD`="#6A3D9A"),
+                IgG_cat=c(`high IgG+ tumor cells`="#FF7F00",
+                          `low IgG+ tumor cells`="#1F78B4" ),
+                IgA_cat=c(`high IgA+ tumor cells`="#FDBF6F",
+                          `low IgA+ tumor cells`="#A6CEE3"),
+                IgG_IgA_var=c(`IgG_positive_tumor.cells`= "#FF7F00", 
+                              `IgA_positive_tumor.cells`="#619CFF" ))
+
+
+
+# Give the path of the Immcantation folder. With a back / at the end
+
+# ImmcantationFolder <- "PATH/"
+
+# Output folder to retrieve the files and plot
+res_folder <-"PATH/"
+```
+
+# Preprocess - Not rendered
+
+See previous script : Figure 4. For preprocess steps necessary to identify clonotypes and clones statistics.   
+
+
+# Reload merged dataset
+
+Reload data
+
+```{r}
+# Metadata ANONYMIZED - NB : Response to ICI is not shared due to patient privacy requirement but can be asked to the study sponsor unpon reasonable request (see article for contact)
+Immcantation_meta_ICI_unique <-readRDS(paste0("PATH/","20260727_Immunoverse_Metadata_AnonymId_ICIresponse_IgTumorCells.rds")) # edit : study sponsor accepted to share the information
+
+
+#reload clone abundance and diversity for all IGH clones
+## Same as in previous script (Figure 4)
+abund_list <- readRDS(paste0("PATH/","20260724_Immcantation_IGH_clonal_alakazamEstimateAbundance_Unweighted_Uniform_anonymized.rds"))
+div <- readRDS(paste0("PATH/","20260724_Immcantation_IGH_clonal_alakazamAlphaDiversity_Unweighted_Uniform_anonymized.rds"))
+
+
+```
+
+
+
+# Figures
+
+## Figure 5A and 5B - Experimental scheme (biorender) and IF stainings
+
+**Figure 5A and 5B compressed > see paper ...** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure5AB_to_render_compressed.pdf"),density = 300)
+plot(img)
+```
+
+## Figure 5C and S11A - Ig diversity vs IgG or IgA-coverage on tumor cells
+
+
+```{r}
+# Plot diversity R/NR or sample_type for all kind of parameters
+## NB : initially a loop on all parameters. Here only the unweighted and uniform=T parameter are selected
+# var_to_iterate<-setNames(names(div),nm = names(div)) # modify the vector to iterate on
+
+var<-"Unweighted_UniformlyResampled"
+
+# for(var in var_to_iterate){
+  # hill_div <- div[[var]]@diversity
+  hill_div <- div
+  
+  ## Merge back with metadata info
+  hill_div<-merge(hill_div,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type","sample_type2","R_NR","IgG_positive_tumor.cells", "IgA_positive_tumor.cells")],by="sample_id")
+  
+  hill_div<-hill_div[!is.na(hill_div$IgG_positive_tumor.cells),] #remove sample with NA in IHC
+  
+  ## convert q in a factor rather than a numeric for plot
+  hill_div$q<-factor(hill_div$q)
+  
+ 
+  # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+  # correlation at specific q
+  # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+  
+  alpha_q0 <- filter(hill_div, q == 0)
+  
+  
+  # cor and test
+  cor_results <- alpha_q0 %>%
+    group_by(sample_type,R_NR) %>%
+    summarise(
+      cor_test = list(cor.test(IgG_positive_tumor.cells, d, method = "spearman")),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      rho = sapply(cor_test, function(x) x$estimate),
+      p_value = sapply(cor_test, function(x) x$p.value)
+    )
+  
+  ## format label
+  cor_results$label <- paste0("rho = ",
+                              formatC(cor_results$rho, digits = 3, format = "f"),
+                              "\n", # "\n" if I want a line return
+                              "p = "
+                              ,ifelse(cor_results$p_value < 0.001,
+                                       formatC(cor_results$p_value, format = "e", digits = 2),
+                                       formatC(cor_results$p_value, digits = 3, format = "f"))
+                              )
+  
+  ## positions
+  cor_results$IgG_positive_tumor.cells<-rep(c(25,75),times=3)
+  cor_results$d<-max(alpha_q0$d)+(IQR(alpha_q0$d)/3)
+  
+  
+  ##plot
+  p<-ggplot(alpha_q0, aes(x = IgG_positive_tumor.cells, y = d)) +
+    # geom_vline(xintercept = 60)+
+    # geom_hline(yintercept = threshold_div)+
+    geom_smooth(aes(color=R_NR),method = "lm")+
+    geom_label(data = cor_results,mapping = aes(label=label,color=R_NR),fill="white")+
+    geom_point(aes(color=R_NR),size=2)+
+    facet_grid(.~sample_type,scales = "free_x",space = "free_x")+
+    # annotate("text",x = 50,y =max(alpha_q0$d),label=paste("fisher.test\np-value:",round(res_test$p.value,2)))+
+    scale_x_continuous(expand = expansion(mult = 0.1)) +  # ← marge en X
+    scale_y_continuous(expand = expansion(mult = 0.1)) +  # ← marge en Y
+    labs(title = "Richness (q=0) - Hill numbers", x = "IgG-labelled tumor cells proportion (%)", y = "IGH Richness\n(Hill number with q=0)",
+         subtitle = "Tumor treated with ICI with both repertoire (frozen rna) and ihc (matching ffpe block) data",
+         caption = var)+  
+    scale_color_manual(values = ColorPal$R_NR)+
+    theme_minimal()
+  
+  #### THIS IS FIGURE 5C
+  ggsave(plot = p,
+         filename = paste0(res_folder,"Figure5C_Immcantation_AlphaDiversity_",var,"_subsetTumorWithIHCdata_RichnessIGHclone_vs_IgGtumorProportion_correlationByResponse.pdf"),
+         height = 4,width = 10)
+  
+  ###################################
+  # same but vs IgA_tumor cells
+  ###################################
+  # cor and test
+  cor_results <- alpha_q0 %>%
+    group_by(sample_type,R_NR) %>%
+    summarise(
+      cor_test = list(cor.test(IgA_positive_tumor.cells, d, method = "spearman")),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      rho = sapply(cor_test, function(x) x$estimate),
+      p_value = sapply(cor_test, function(x) x$p.value)
+    )
+  
+  ## format label
+  cor_results$label <- paste0("rho = ",
+                              formatC(cor_results$rho, digits = 3, format = "f"),
+                              "\n",
+                              "p = "
+                              ,ifelse(cor_results$p_value < 0.001,
+                                       formatC(cor_results$p_value, format = "e", digits = 2),
+                                       formatC(cor_results$p_value, digits = 3, format = "f"))
+                              )
+  
+  ## positions
+  cor_results$IgA_positive_tumor.cells<-rep(c(25,60),times=3)
+  cor_results$d<-max(alpha_q0$d)+(IQR(alpha_q0$d)/3)
+  
+  
+  p<-ggplot(alpha_q0, aes(x = IgA_positive_tumor.cells, y = d)) +
+    # geom_vline(xintercept = 60)+
+    # geom_hline(yintercept = threshold_div)+
+    geom_smooth(aes(color=R_NR),method = "lm")+
+    geom_label(data = cor_results,mapping = aes(label=label,color=R_NR),fill="white")+
+    geom_point(aes(color=R_NR),size=2)+
+    facet_grid(.~sample_type,scales = "free_x",space = "free_x")+
+    # annotate("text",x = 50,y =max(alpha_q0$d),label=paste("fisher.test\np-value:",round(res_test$p.value,2)))+
+    # scale_x_continuous(expand = expansion(mult = 0.1)) +  # ← marge en X
+    scale_y_continuous(expand = expansion(mult = 0.1)) +  # ← marge en Y
+    labs(title = "Richness (q=0) - Hill numbers", x = "IgA-labelled tumor cells proportion (%)", y = "IGH Richness\n(Hill number with q=0)",
+         subtitle = "Tumor treated with ICI with both repertoire (frozen rna) and ihc (matching ffpe block) data",
+         caption = var)+  
+    scale_color_manual(values = ColorPal$R_NR)+
+    theme_minimal()
+  
+  ### This is Figure supplementary S11A
+  
+  ggsave(plot = p,
+         filename = paste0(res_folder,"S11A_Immcantation_AlphaDiversity_",var,"_subsetTumorWithIHCdata_RichnessIGHclone_vs_IgAtumorProportion_correlationByResponse.pdf"),
+         height = 4,width = 10)
+  
+  ########################################################################
+  ## Same but for all values of q >>>> Not included in the paper but mentionned in the text (data not shared)
+  ########################################################################
+
+  # cor and test
+  cor_results <- hill_div %>%
+    group_by(sample_type,q,R_NR) %>%
+    summarise(
+      cor_test = list(cor.test(IgG_positive_tumor.cells, d, method = "spearman")),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      rho = sapply(cor_test, function(x) x$estimate),
+      p_value = sapply(cor_test, function(x) x$p.value)
+    )
+  
+  ## format label
+  cor_results$label <- paste0("rho=",
+                              formatC(cor_results$rho, digits = 3, format = "f"),
+                              "\n",
+                              "p="
+                              ,ifelse(cor_results$p_value < 0.001,
+                                       formatC(cor_results$p_value, format = "e", digits = 2),
+                                       formatC(cor_results$p_value, digits = 3, format = "f"))
+                              )
+  
+  ## positions
+  cor_results$IgG_positive_tumor.cells<-rep(rep(c(25,75),times=11),times=3)
+  # max_per_plot <-
+  cor_results$d<-0
+  
+  
+  ## Replace the lbel by a "" if it is not significant / remove p_value from label
+  cor_results$label<-ifelse(test =cor_results$p_value>=0.05 ,yes = "",no = gsub("\\np=.*","",cor_results$label))
+  
+
+  ##plot
+  p<-ggplot(hill_div, aes(x = IgG_positive_tumor.cells, y = d)) +
+    # geom_vline(xintercept = 60)+
+    # geom_hline(yintercept = threshold_div)+
+    geom_smooth(aes(color=R_NR),method = "lm")+
+    geom_text(data = cor_results,mapping = aes(label=label,color=R_NR),size=3,nudge_y =-100)+
+        # geom_label(data = cor_results,mapping = aes(label=label,color=R_NR),fill="white",size=2,nudge_y =+100)+
+    geom_point(aes(color=R_NR),size=2)+
+    scale_x_continuous(expand = expansion(mult = 0.1)) +  # ← marge en X
+    scale_y_continuous(expand = expansion(mult = 0.1)) +  # ← marge en Y
+    labs(title = "", x = "IgG-labelled tumor cells proportion (%)", y = "Clone diversity (Hill number)"
+         # subtitle = "Tumor treated with ICI with both repertoire (frozen rna) and ihc (matching ffpe block) data"
+         )+  
+    scale_color_manual(values = ColorPal$R_NR)+
+    facet_grid(q~sample_type,scales = "free_y")+
+    theme_minimal()
+  
+    # ggsave(plot = p,
+    #      filename = paste0(res_folder,"Immcantation_AlphaDiversity_",var,"_subsetTumorWithIHCdata_AllQValues_vs_IgGtumorProportion_correlationByResponseV1.pdf"),
+    #      height = 16,width = 8)
+  
+  
+#}
+
+```
+
+
+**Figure 5C** 
+```{r,fig.height=10,fig.width=10}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure5C_Immcantation_AlphaDiversity_Unweighted_UniformlyResampled_subsetTumorWithIHCdata_RichnessIGHclone_vs_IgGtumorProportion_correlationByResponse.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure S11A** 
+```{r,fig.height=10,fig.width=10}
+img <- magick::image_read_pdf(paste0(res_folder,"S11A_Immcantation_AlphaDiversity_Unweighted_UniformlyResampled_subsetTumorWithIHCdata_RichnessIGHclone_vs_IgAtumorProportion_correlationByResponse.pdf"),density = 300)
+plot(img)
+```
+
+
+
+## Figure 5D and S11B - Top 5 Ig clone frequency vs IgG or IgA-coverage on tumor cells
+
+
+```{r}
+# Plot diversity R/NR or sample_type for all kind of parameters
+## NB : initially a loop on all parameters. Here only the unweighted and uniform=T parameter are selected
+# var_to_iterate<-setNames(names(div),nm = names(div)) # modify the vector to iterate on
+
+var<-"Unweighted_UniformlyResampled"
+
+# for(var in var_to_iterate){
+#   clone_frequency <- abund_list[[var]]@abundance
+
+  clone_frequency <- abund_list
+  
+  ## Merge back with metadata info
+  clone_frequency<-merge(clone_frequency,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type","sample_type2","R_NR","IgG_positive_tumor.cells", "IgA_positive_tumor.cells")],by="sample_id")
+  
+  clone_frequency<-clone_frequency[!is.na(clone_frequency$IgG_positive_tumor.cells),] #remove sample with NA in IHC
+
+  ###########################################################################
+  # Top clones
+  ###########################################################################
+  ## top 5
+  #### actually initially top 10 but adapt to top5 later ...
+  clone_frequency_top10<-clone_frequency
+  clone_frequency_top10$rank_character<-as.character(clone_frequency_top10$rank)
+  clone_frequency_top10 <- clone_frequency_top10[clone_frequency_top10$rank_character %in% as.character(1:5),]#filter top 10
+  clone_frequency_top10$rank_character <- factor(clone_frequency_top10$rank_character,levels = as.character(1:5)) # as factor
+  
+  ## Correaltion IgG proportion and clone frequency
+  
+  # cor and test
+  cor_results <- clone_frequency_top10 %>%
+    group_by(rank_character,sample_type,R_NR) %>%
+    summarise(
+      cor_test = list(cor.test(IgG_positive_tumor.cells, p, method = "spearman")),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      rho = sapply(cor_test, function(x) x$estimate),
+      p_value = sapply(cor_test, function(x) x$p.value)
+    )
+  
+  ## format label
+  cor_results$label <- paste0("rho = ",
+                              formatC(cor_results$rho, digits = 3, format = "f"),
+                              "\n",
+                              "p = "
+                              ,ifelse(cor_results$p_value < 0.001,
+                                       formatC(cor_results$p_value, format = "e", digits = 2),
+                                       formatC(cor_results$p_value, digits = 3, format = "f"))
+                              )
+  
+  ## positions
+  cor_results$IgG_positive_tumor.cells<-ifelse(cor_results$R_NR=="NR",yes=25,no=75)
+  cor_results$p<-0.5
+  
+  p<-ggplot(clone_frequency_top10,aes(x =IgG_positive_tumor.cells,y= p,color=R_NR))+
+    geom_point(size=2)+
+    geom_smooth(aes(color=R_NR),method = "lm")+
+    geom_label(data = cor_results,mapping = aes(label=label,color=R_NR),fill="white",size=3)+
+    scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+    # facet_grid(rank_character~.,scales = "free_x",space = "free_x")+
+    facet_grid(sample_type~rank_character)+
+    theme_minimal()+
+    scale_color_manual(values = ColorPal$R_NR)+
+    # theme(legend.position = "none")+
+    labs(y="Clone frequency",title = "Rank clone abundance - Top 10 clones",
+         x="IgG-labelled tumor cells proportion (%)",
+         subtitle = "Tumor treated with ICI with both repertoire (frozen rna) and ihc (matching ffpe block) data",
+         caption = var)
+  
+  #### THIS IS FIGURE 5D
+  
+  ggsave(plot = p,
+         filename = paste0(res_folder,"Figure5D_Immcantation_ClonalFrequency_",var,"_Top10clone_SplitTop10_correlation_response_and_IgGproportion.pdf"),
+         height = 6,width = 12)
+  
+  
+  
+  
+  
+    ## Correaltion IgA proportion and clone frequency
+  
+  # cor and test
+  cor_results <- clone_frequency_top10 %>%
+    group_by(rank_character,sample_type,R_NR) %>%
+    summarise(
+      cor_test = list(cor.test(IgA_positive_tumor.cells, p, method = "spearman")),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      rho = sapply(cor_test, function(x) x$estimate),
+      p_value = sapply(cor_test, function(x) x$p.value)
+    )
+  
+  ## format label
+  cor_results$label <- paste0("rho = ",
+                              formatC(cor_results$rho, digits = 3, format = "f"),
+                              "\n",
+                              "p = "
+                              ,ifelse(cor_results$p_value < 0.001,
+                                       formatC(cor_results$p_value, format = "e", digits = 2),
+                                       formatC(cor_results$p_value, digits = 3, format = "f"))
+                              )
+  
+  ## positions
+  cor_results$IgA_positive_tumor.cells<-ifelse(cor_results$R_NR=="NR",yes=25,no=60)
+  cor_results$p<-0.5
+  
+  p<-ggplot(clone_frequency_top10,aes(x =IgA_positive_tumor.cells,y= p,color=R_NR))+
+    geom_point(size=2)+
+    geom_smooth(aes(color=R_NR),method = "lm")+
+    geom_label(data = cor_results,mapping = aes(label=label,color=R_NR),fill="white",size=3)+
+    scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+    # facet_grid(rank_character~.,scales = "free_x",space = "free_x")+
+    facet_grid(sample_type~rank_character)+
+    theme_minimal()+
+    scale_color_manual(values = ColorPal$R_NR)+
+    # theme(legend.position = "none")+
+    labs(y="Clone frequency",title = "Rank clone abundance - Top 10 clones",
+         x="IgA-labelled tumor cells proportion (%)",
+         subtitle = "Tumor treated with ICI with both repertoire (frozen rna) and ihc (matching ffpe block) data",
+         caption = var)
+  
+  ## THIS IS SUPPLEMENTARY FIGURE S11B
+  ggsave(plot = p,
+         filename = paste0(res_folder,"S11B_Immcantation_ClonalFrequency_",var,"_Top10clone_SplitTop10_correlation_response_and_IgAproportion.pdf"),
+         height = 6,width = 12)
+
+
+#}
+  
+  
+```
+
+
+
+**Figure 5D** 
+```{r,fig.height=10,fig.width=12}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure5D_Immcantation_ClonalFrequency_Unweighted_UniformlyResampled_Top10clone_SplitTop10_correlation_response_and_IgGproportion.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure S11B** 
+```{r,fig.height=10,fig.width=12}
+img <- magick::image_read_pdf(paste0(res_folder,"S11B_Immcantation_ClonalFrequency_Unweighted_UniformlyResampled_Top10clone_SplitTop10_correlation_response_and_IgAproportion.pdf"),density = 300)
+plot(img)
+```
+
+
+
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```

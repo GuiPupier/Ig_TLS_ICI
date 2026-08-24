@@ -1,0 +1,3581 @@
+---
+title: "Immunoverse Immcantation Clonal analysis - Tumor, Blood, response to ICI"
+author: "Guilhem Pupier"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  rmdformats::readthedown:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+
+Immunoverse bulk Ig (heavy and light chains) targeted capture libraries are sequenced with MiSeq 2\*300 bp :
+
+-   R1 : 8 bases UMI + 13 bases template switch (TS=AACCGCCAGGAGT) + Insert (V\>D\>J\>C)  
+-   R2 : Constant primer around 20 bp (gene specific primer = GSP2) + Insert (C\>J\>D\>V)  
+
+Paired **Tumor**, **PBMC before ICI treatment (T0)** and **after 6 weeks of ICI treatment (T6)**, stored frozen, were processed to extract RNA, generate Immunoverse libraries, and compare the total Ig repertoire between these samples and according to **ICI treatment response (R= responders, NR= non responders)**. A total of 90 paired samples from 30 patients (12NR + 18R) were analyzed together with an additional tumor from a NR patient lacking the paired blood samples, as well as 5 blood samples from **healthy donors (HD)** used as reference.
+
+Goal :
+
+- To analyze Tumor clonotypes vs Blood clonotypes before and after treatment (R vs NR)  
+- To analyze Tumor clonotypes between R vs NR  
+
+Sections :
+
+- **Preprocess** :  
+All pre-process step of **Immunoverse** data following Immcantation pipeline with raw reads preparation, IgBlast alignment, clonotype table clustering, clonal grouping step and lineage tree reconstruction.    
+
+- **Reload merged dataset** :  
+Reload data to generate plots.
+
+- **Figures** : 
+Script to reproduce Figure 4, S9 and S10.  
+
+# Load required packages
+
+
+```{r,eval=T}
+library(airr)
+library(alakazam)
+library(shazam) # airr data packages
+
+library(data.table) # function fread() for efficient and fast read of tab file
+
+library(stringi)
+library(stringr) # string manipulations
+
+library(dplyr) 
+library(tidyr)
+library(reshape2) # table manipulations
+
+library(MESS) # compute AUC
+
+library(pastecs)
+library(RColorBrewer)
+library(viridis) # color palettes
+library(patchwork)
+library(ggplot2)
+library(ggpubr)
+library(grid)
+library(gridExtra)
+library(scales) # plot functions
+#from Heather Turner @stackoverflow ## Adapt y scale in log scale 
+base_breaksLog10 <- function(n = 10){
+  function(x) {
+    axisTicks(log10(range(x, na.rm = TRUE)), log = T, n = n)
+  }
+}
+base_breaksLog1p <- function(n = 10){
+  function(x) {
+    axisTicks(log1p(range(x, na.rm = TRUE)), log = T, n = n)
+  }
+}
+
+# library(qs) # optimize (faster than rds) writing and reading of large dataset in R
+
+# plot contingency (fro Maxime Meylan)
+plot_contingency <- function(data,
+           variables = c("TLS_pos", "HBV"),
+           hide_legend = F,
+           text_size=6,
+           text_position_side=T,
+           create_labels = T,
+           inverse_factor2=F,
+           order_factor=NULL,
+           palette = NA,
+           geom_label=F,
+           test_name = c("chisq.test", "fisher.test")[1],
+           labs = c(xlab = "",
+                    ylab = "",
+                    legend_title = ""),
+           hide_test = F,
+           title = ""){
+    if(inverse_factor2){
+      data[,variables[2]] <- factor(data[,variables[2]],levels=rev(levels(data[,variables[2]])))
+    }
+    cont_table <- table(data[,variables[1]],data[,variables[2]])
+    #clean data table to avoid empty rows
+    non_empty_rows <- rowSums(cont_table)!=0
+    cont_table <- cont_table[non_empty_rows,]
+
+    if(create_labels){
+      #sapply(levels(factor(data[,variables[2]])), function(x) paste(variables[2],x,sep="_"))
+      colnames(cont_table) <- sapply(levels(factor(data[,variables[2]])), function(x) paste(variables[2],x,sep="_"))
+      rownames(cont_table) <- sapply(levels(factor(data[,variables[1]])), function(x) paste(variables[1],x,sep="_"))
+    }
+  if(test_name != "fisher.test" & test_name != "chisq.test"){
+    stop("incorrect test, valid options are fisher.test or chisq.test")
+  }
+  if(test_name == "fisher.test"){
+    error_test <-  if(class(try(fisher.test(cont_table),silent=T)) == "try-error"){
+      test_res <- fisher.test(cont_table,simulate.p.value = T)
+    }else{
+      test_res <- fisher.test(cont_table)
+    }
+  }
+  if(test_name == "chisq.test"){
+    test_res <- chisq.test(cont_table)
+  }
+  #make sure there is a matrix (enough values in both sides)
+  if(!is.null(dim(cont_table))){
+    cont_table_perc <-apply(cont_table,1,function(x) {
+      res <- x / sum(x) *100
+    })
+    cont_table_m <- melt(cont_table_perc)
+    cont_table_m$Var1 <- factor(cont_table_m$Var1)
+    p <- ggplot(data=cont_table_m, aes(x=Var2,y=value,fill=Var1,label=value))
+    p <- p + geom_bar(stat="identity",width=0.95)
+    #to reverse order of bars
+    #p <- p + geom_bar(stat="identity",width=0.95,position = position_stack(reverse = TRUE))
+    
+    if(geom_label){
+      if(text_position_side){
+        p <- p + geom_label(color="white",label = paste0(as.vector(t(cont_table))," (",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }else{
+        p <- p + geom_label(color="white",label = paste0(as.vector(t(cont_table)),"\n(",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }
+    }else{
+      if(text_position_side){
+        p <- p + geom_text(label = paste0(as.vector(t(cont_table))," (",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }else{
+        p <- p + geom_text(label = paste0(as.vector(t(cont_table)),"\n(",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }
+    }
+    
+    p <- p + theme_minimal()
+
+    if(any(!is.na(palette))){
+      p <- p + scale_fill_manual(values = palette)
+    }
+    #p <- p + theme(legend.title = element_blank())#,axis.text.x = element_text(angle = 25, hjust = 1))
+    p <- p + guides(fill=guide_legend(title=labs[3]))
+    if(hide_test){
+      p <- p + labs(subtitle=paste("p = ",format(test_res$p.value,digits=3),sep=" "),title=title,x=labs[1],y=labs[2])
+      if(test_res$p.value < 0.05 ) p <- p + theme(plot.subtitle=element_text(face="bold"))
+    }else{
+      p <- p + labs(subtitle=paste(test_name, " p = ",format(test_res$p.value,digits=3),sep=" "),title=title,x=labs[1],y=labs[2])
+      if(test_res$p.value < 0.05 ) p <- p + theme(plot.subtitle=element_text(face="bold"))
+    }
+
+    if(hide_legend){
+      p <- p + guides(fill=FALSE)
+    }
+  }else{
+    p <- ggplot()
+    test_res <-1
+  }
+  return(list(p,test_res,cont_table))
+
+}
+
+# Color palettes for consistency on plot
+##Get the color of the ggplot (stack overflow :https://stackoverflow.com/questions/8197559/emulate-ggplot2-default-color-palette)
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+## palette of R_NR factor
+pal_R_NR_HD <- gg_color_hue(3)
+names(pal_R_NR_HD)<-c("NR","R","HD")
+## palette used for heatmap will be used for all plots
+ColorPal<- list(Arm=c(`Nivo-Ipi`="#6A3D9A",
+                      Nivo="#1F78B4",
+                      TKI="#FFD92F"),
+                R_NR=c(R="#00BA38",
+                           NR="#F8766D",
+                       HD="#619CFF"),
+                sample_storage=c(FFPE="darkgrey",
+                                 Frozen="#E7298A"),
+                sample_type=c(`Tumor.T0`="black",
+                         `PBMC.T0`="#1F78B4",
+                         `PBMC.T6`="#E31A1C",
+                         `Tonsil.T0`="darkgrey"),
+                sample_type2=c(`Tumor.T0`="black",
+                         `PBMC.T0`="#1F78B4",
+                         `PBMC.T6`="#E31A1C",
+                         `PBMC.HD`="#6A3D9A"),
+                IgG_cat=c(`high IgG+ tumor cells`="#FF7F00",
+                          `low IgG+ tumor cells`="#1F78B4" ),
+                IgA_cat=c(`high IgA+ tumor cells`="#FDBF6F",
+                          `low IgA+ tumor cells`="#A6CEE3"),
+                IgG_IgA_var=c(`IgG_positive_tumor.cells`= "#FF7F00", 
+                              `IgA_positive_tumor.cells`="#619CFF" ))
+
+
+
+# Give the path of the Immcantation folder. With a back / at the end
+
+# ImmcantationFolder <- "PATH/"
+
+
+# Output folder to get the files and plot
+res_folder <-"PATH/"
+```
+
+# Preprocess - Not rendered
+
+All script bellow are run only one time - not re run for plot/render markdown. 
+
+## Reads preprocess
+
+### Fastp preprocess
+
+-   **Fastp** : Trim adapters + Correct overlapping base (R1+R2) + length filter 60 bp (around 20 bases primers + min 40 bases insert) + Filter low quality reads (Q20)  
+
+```{bash,eval=F}
+# in a conda environment : conda activate fastp
+
+cd PATH
+
+# read all the file of 104 lines in array
+readarray -t input_fileR1 < input_file_R1paths.txt
+readarray -t input_fileR2 < input_file_R2paths.txt
+readarray -t output_file < uniq_id_n104samples.txt
+
+#Moove to out_dir : Immcantation_dir
+Immcantation_dir="PATH/"
+
+mkdir pipeline_log
+mkdir 01_Fastp
+
+#iterate on all 104 samples by positions
+## NB : initially 104 samples because some FFPE samples were also included // not in the final article ! 
+
+for i in $(seq 0 103); do
+  # get the corresponding paths and output name by position
+    file_inR1="${input_fileR1[${i}]}"
+    file_inR2="${input_fileR2[${i}]}"
+    file_out="${output_file[${i}]}"
+    echo "files: $file_inR1 and $file_inR2 and $file_out"
+    
+    echo "run fastp"
+    fastp --in1 $file_inR1 \
+    --in2 $file_inR2 \
+    --out1 "${Immcantation_dir}01_Fastp/${file_out}_fastp_processed.R1.fastq" \
+    --out2 "${Immcantation_dir}01_Fastp/${file_out}_fastp_processed.R2.fastq" \
+    --json "${Immcantation_dir}01_Fastp/${file_out}_fastp.json" \
+    --html "${Immcantation_dir}01_Fastp/${file_out}_fastp.html" \
+    --dont_eval_duplication \
+    --correction \
+    --overlap_len_require=30 \
+    --overlap_diff_limit=5 \
+    --overlap_diff_percent_limit=20 \
+    --average_qual=20 \
+    --length_required=60 \
+    --adapter_sequence=AGATCGGAAGAGCACACGTCTGAACTCCAGTCA \
+    --adapter_sequence_r2=AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+    --thread=30 > "${Immcantation_dir}01_Fastp/${file_out}_fastp.log" 2>&1
+
+    echo "complete"
+done
+
+# conda deactivate
+
+```
+
+### pRESTO
+
+-   MaskPrimers.py : Identify UMI+TS in R1 and Constant primer in R2  
+-   PairSeq.py : pair back R1 and R2 after MaskPrimers.py  
+-   AssemblePairs.py sequential : assemble R1 and R2 in one full read to align with IgBlast  
+    NB : UMI are not considered at this step because of too low diversity (only 8 bases ...). Collapse duplicates sequences is also not done at this step but rather with Alakazam package, after IgBlast alignment.  
+-   Re run Maskprimer.py score to extract Template switch + UMI which can have been re-inserted if R1 and R2 are totally overlapping.  
+
+```{bash,eval=F}
+
+mkdir 02_pRESTO
+mkdir 02_pRESTO/01_MaskPrimers
+mkdir 02_pRESTO/02_PairSeq
+mkdir 02_pRESTO/03_AssemblePairs
+mkdir 02_pRESTO/04_MaskPrimers2
+
+# put the script in a sh executable
+
+#!/bin/bash
+
+# Activate conda environment
+source PATH/conda.sh  # Adjust path if needed
+conda activate pRESTO
+
+Immcantation_dir="PATH/"
+
+cd ${Immcantation_dir}
+
+files=$(cat PATH/uniq_id_n104samples.txt)
+
+# Start timing
+start_time=$(date +%s)
+start_date=$(date +"%Y-%m-%d %H:%M:%S")
+echo ">>> Pipeline started at: $start_date"
+
+
+for file in $files; do
+
+  echo $file
+
+## Identify UMI, template switch and C primers
+
+### UMI and template switch in R1
+echo "Runing MaskPrimers.py score on R1 to identify Barcode-UMI"
+    MaskPrimers.py score -s "${Immcantation_dir}01_Fastp/${file}_fastp_processed.R1.fastq" \
+    -p PATH/02_pRESTO/TS_R1.fasta \
+    --barcode --mode cut \
+    --start 8 \
+    --maxerror 0.16 \
+    --outdir "${Immcantation_dir}02_pRESTO/01_MaskPrimers/" \
+    --outname "${file}_R1" \
+    --log "${Immcantation_dir}02_pRESTO/01_MaskPrimers/${file}_MP_TS_R1.log" > "${Immcantation_dir}pipeline_log/${file}_pRESTO_perf.log" 2>&1
+
+echo "Runing ParseLog.py on R1 MaskPrimer log to identify Barcode-UMI"
+    ParseLog.py -l "${Immcantation_dir}02_pRESTO/01_MaskPrimers/${file}_MP_TS_R1.log" \
+    -f ID PRIMER PRSTART BARCODE INSEQ ALIGN OUTSEQ ERROR >> "${Immcantation_dir}pipeline_log/${file}_pRESTO_perf.log" 2>&1
+
+### C primers in R2
+
+echo "Runing MaskPrimers.py score on R2 to identify C primer"
+    MaskPrimers.py score -s "${Immcantation_dir}01_Fastp/${file}_fastp_processed.R2.fastq" \
+    -p PATH/02_pRESTO/Cprimers.fasta \
+    --mode tag \
+    --start 0 \
+    --maxerror 0.12 \
+    --pf ArcherPrimer \
+    --outdir "${Immcantation_dir}02_pRESTO/01_MaskPrimers/" \
+    --outname "${file}_R2" \
+    --log "${Immcantation_dir}02_pRESTO/01_MaskPrimers/${file}_MP_Cregion_R2.log" >> "${Immcantation_dir}pipeline_log/${file}_pRESTO_perf.log" 2>&1
+
+echo "Runing ParseLog.py on R2 MaskPrimer log - C primer"
+    ParseLog.py -l "${Immcantation_dir}02_pRESTO/01_MaskPrimers/${file}_MP_Cregion_R2.log" \
+    -f ID PRIMER INSEQ ALIGN OUTSEQ ERROR >> "${Immcantation_dir}pipeline_log/${file}_pRESTO_perf.log" 2>&1
+
+
+## Copy UMI and Primer annotation and synchronize R1 and R2
+
+echo "Runing PairSeq.py on R1 and R2 after MaskPrimer"
+    PairSeq.py -1 "${Immcantation_dir}02_pRESTO/01_MaskPrimers/${file}_R1_primers-pass.fastq" \
+    -2 "${Immcantation_dir}02_pRESTO/01_MaskPrimers/${file}_R2_primers-pass.fastq" \
+    --coord illumina \
+    --outdir "${Immcantation_dir}02_pRESTO/02_PairSeq/" >> "${Immcantation_dir}pipeline_log/${file}_pRESTO_perf.log" 2>&1
+
+## Assemble R1 and R2 pairs in one full length read
+
+echo "Runing AssemblePairs.py sequential on consensus R1 and consensus R2"
+    AssemblePairs.py sequential -1 "${Immcantation_dir}02_pRESTO/02_PairSeq/${file}_R1_primers-pass_pair-pass.fastq" \
+    -2 "${Immcantation_dir}02_pRESTO/02_PairSeq/${file}_R2_primers-pass_pair-pass.fastq" \
+    -r PATH/igblast/fasta/imgt_human_ig_v.fasta \
+        --coord illumina --rc tail --scanrev --1f BARCODE --2f ARCHERPRIMER \
+        --aligner blastn \
+        --nproc 30 \
+        --outname $file \
+        --outdir "${Immcantation_dir}02_pRESTO/03_AssemblePairs/" \
+        --log "${Immcantation_dir}02_pRESTO/03_AssemblePairs/${file}_AP.log" >> "${Immcantation_dir}pipeline_log/${file}_pRESTO_perf.log" 2>&1
+
+# Re run Maskprimer.py score to extract Template switch + UMI which can have been re-inserted if R1 and R2 are totally overlapping.
+
+# --failed to keep reads with no UMI-TS ... will be concatenated back with trimmed reads after maskprimers
+
+### UMI and template switch in assembled reads
+echo "Runing MaskPrimers.py score on assembled reads to identify Barcode-UMI"
+    MaskPrimers.py score -s "${Immcantation_dir}02_pRESTO/03_AssemblePairs/${file}_assemble-pass.fastq" \
+    -p PATH/02_pRESTO/TS_R1.fasta \
+    --mode cut \
+    --start 8 \
+    --maxerror 0.16 \
+    --failed \
+    --outdir "${Immcantation_dir}02_pRESTO/04_MaskPrimers2/" \
+    --outname "${file}_clean" \
+    --log "${Immcantation_dir}02_pRESTO/04_MaskPrimers2/${file}_MP_TS_assemble_reads.log" >> "${Immcantation_dir}pipeline_log/${file}_pRESTO_perf.log" 2>&1
+
+echo "Runing ParseLog.py on R1 MaskPrimer log to identify Barcode-UMI"
+  ParseLog.py -l "${Immcantation_dir}02_pRESTO/04_MaskPrimers2/${file}_MP_TS_assemble_reads.log" \
+  -f ID PRIMER PRSTART BARCODE INSEQ ALIGN OUTSEQ ERROR >> "${Immcantation_dir}pipeline_log/${file}_pRESTO_perf.log" 2>&1
+
+# concatenate back maskprimer.py pass reads and fail (pass = trimmed / failed = without TS, not trimmed= good read ...)
+  cat "${Immcantation_dir}02_pRESTO/04_MaskPrimers2/${file}_clean_primers-pass.fastq" "${Immcantation_dir}02_pRESTO/04_MaskPrimers2/${file}_clean_primers-fail.fastq" > "${Immcantation_dir}02_pRESTO/04_MaskPrimers2/${file}_clean_primers-all_concatenate.fastq"
+done
+
+# End time and date
+end_time=$(date +%s)
+end_date=$(date +"%Y-%m-%d %H:%M:%S")
+duration=$((end_time - start_time))
+hours=$((duration / 3600))
+minutes=$(( (duration % 3600) / 60 ))
+seconds=$((duration % 60))
+
+# Final report
+echo ">>> Pipeline ended at: $end_date"
+echo ">>> Total runtime: ${hours}h ${minutes}m ${seconds}s (${duration} seconds)"
+
+
+# nano > Copy paste the script from the shebang to the final report > pRESTO_loop_all_samples.sh
+
+# As executable file
+chmod +x pRESTO_loop_all_samples.sh
+
+# run the loop as nohup so that it do not keyboad interupt when the session disconnect
+nohup ./pRESTO_loop_all_samples.sh > pipeline_log/presto_loop_nohup__all_samples_log.txt 2>&1 &
+
+```
+
+### Fastp before alignment
+
+-   Fastp to filter reads lower than 40 bp and get quality of reads before alignment.  
+
+```{bash,eval=F}
+# in a conda environment : conda activate fastp
+
+mkdir 02_pRESTO/05_Fastp_ready_to_align
+
+# put the script in a sh executable
+
+#!/bin/bash
+
+# Activate conda environment
+source PATH/conda.sh  # Adjust path if needed
+conda activate fastp
+
+Immcantation_dir="PATH/"
+
+cd ${Immcantation_dir}
+
+files=$(cat PATH/uniq_id_n104samples.txt)
+
+# Start timing
+start_time=$(date +%s)
+start_date=$(date +"%Y-%m-%d %H:%M:%S")
+echo ">>> Pipeline started at: $start_date"
+
+for file in $files; do
+
+  echo $file
+
+    echo "run fastp"
+    fastp --in1 "${Immcantation_dir}02_pRESTO/04_MaskPrimers2/${file}_clean_primers-all_concatenate.fastq" \
+    --out1 "${Immcantation_dir}02_pRESTO/05_Fastp_ready_to_align/${file}_ready_to_align.fastq" \
+    --json "${Immcantation_dir}02_pRESTO/05_Fastp_ready_to_align/${file}_ready_to_align.json" \
+    --html "${Immcantation_dir}02_pRESTO/05_Fastp_ready_to_align/${file}_ready_to_align.html" \
+    --dont_eval_duplication --correction \
+    --overlap_len_require=30 --overlap_diff_limit=5 --overlap_diff_percent_limit=20 \
+    --average_qual=20 \
+    --length_required=40 \
+    --adapter_sequence=AGATCGGAAGAGCACACGTCTGAACTCCAGTCA \
+    --adapter_sequence_r2=AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+    --thread=16 > "${Immcantation_dir}pipeline_log/${file}_ready_to_align.log" 2>&1
+
+    # Ajoutez votre traitement pour chaque itération de la boucle
+    echo "complete"
+
+done
+
+# End time and date
+end_time=$(date +%s)
+end_date=$(date +"%Y-%m-%d %H:%M:%S")
+duration=$((end_time - start_time))
+hours=$((duration / 3600))
+minutes=$(( (duration % 3600) / 60 ))
+seconds=$((duration % 60))
+
+# Final report
+echo ">>> Pipeline ended at: $end_date"
+echo ">>> Total runtime: ${hours}h ${minutes}m ${seconds}s (${duration} seconds)"
+
+# nano > Copy paste the script from the shebang to the done of the loop > fastp_beforeIgBlast_loop_all_samples.sh
+
+# As executable file
+chmod +x fastp_beforeIgBlast_loop_all_samples.sh
+
+# run the loop as nohup so that it do not keyboad interupt when the session disconnect
+nohup ./fastp_beforeIgBlast_loop_all_samples.sh > pipeline_log/fastp_beforeIgBlast_loop_nohup__all_samples_log.txt 2>&1 &
+
+
+
+
+####################
+# conda deactivate 
+
+```
+
+
+## IgBlast alignment
+
+Align against Ig and Tr. Tr is used then to filter incorrect alignment
+
+```{bash,eval=F}
+# in a conda environment : conda activate pRESTO
+
+Immcantation_dir="PATH/"
+
+cd ${Immcantation_dir}
+
+files=`cat uniq_id_n104samples.txt`
+
+mkdir 03_ChangeO
+mkdir 03_ChangeO/01_IgBlast
+
+# put the script in a sh executable
+
+#!/bin/bash
+
+# Activate conda environment
+source PATH/conda.sh  # Adjust path if needed
+conda activate pRESTO
+
+Immcantation_dir="PATH/"
+
+cd ${Immcantation_dir}
+
+files=$(cat PATH/uniq_id_n104samples.txt)
+
+# Start timing
+start_time=$(date +%s)
+start_date=$(date +"%Y-%m-%d %H:%M:%S")
+echo ">>> Pipeline started at: $start_date"
+
+for file in $files; do
+
+  echo $file
+
+## IgBlast 1.22 alignment - IG
+
+echo "Runing AssignGenes.py igblast 1.22 against IMGT database - For IG"
+
+# Input file WITHOUT any collapse duplicate but on Maskqual.fastq file
+## IgBlast alignment
+    AssignGenes.py igblast -s "${Immcantation_dir}02_pRESTO/05_Fastp_ready_to_align/${file}_ready_to_align.fastq" \
+    -b PATH/igblast \
+    --organism human \
+    --loci ig \
+    --format blast \
+    --outname "${file}_ig" \
+    --outdir "${Immcantation_dir}03_ChangeO/01_IgBlast/" \
+    --nproc 32 > "${Immcantation_dir}pipeline_log/${file}_ChangeO_and_PostProcess_perf.log" 2>&1
+
+## Convert IgBlast result in a database
+echo "Runing MakeDb.py igblast to convert IgBlast IG result in a database"
+    MakeDb.py igblast -i "${Immcantation_dir}03_ChangeO/01_IgBlast/${file}_ig_igblast.fmt7" \
+    -s "${Immcantation_dir}03_ChangeO/01_IgBlast/${file}_ready_to_align.fasta" \
+    -r PATH/germlines/imgt/human/vdj PATH/germlines/imgt/human/constant \
+    --extended \
+    --log "${Immcantation_dir}03_ChangeO/01_IgBlast/${file}_igblast_ig.log" \
+    --outdir "${Immcantation_dir}03_ChangeO/01_IgBlast/" >> "${Immcantation_dir}pipeline_log/${file}_ChangeO_and_PostProcess_perf.log" 2>&1
+
+
+## IgBlast 1.22 alignment - TR
+
+echo "Runing AssignGenes.py igblast 1.22 against IMGT database - For TR"
+
+# Input file WITHOUT any collapse duplicate but on Maskqual.fastq file
+## IgBlast alignment
+    AssignGenes.py igblast -s "${Immcantation_dir}02_pRESTO/05_Fastp_ready_to_align/${file}_ready_to_align.fastq" \
+    -b PATH/igblast \
+    --organism human \
+    --loci tr \
+    --format blast \
+    --outname "${file}_tr" \
+    --outdir "${Immcantation_dir}03_ChangeO/01_IgBlast/" \
+    --nproc 32 >> "${Immcantation_dir}pipeline_log/${file}_ChangeO_and_PostProcess_perf.log" 2>&1
+
+## Convert IgBlast result in a database
+echo "Runing MakeDb.py igblast to convert IgBlast TR result in a database"
+    MakeDb.py igblast -i "${Immcantation_dir}03_ChangeO/01_IgBlast/${file}_tr_igblast.fmt7" \
+    -s "${Immcantation_dir}03_ChangeO/01_IgBlast/${file}_ready_to_align.fasta" \
+    -r PATH/germlines/imgt/human/vdj PATH/germlines/imgt/human/constant \
+    --extended \
+    --log "${Immcantation_dir}03_ChangeO/01_IgBlast/${file}_igblast_tr.log" \
+    --outdir "${Immcantation_dir}03_ChangeO/01_IgBlast/" >> "${Immcantation_dir}pipeline_log/${file}_ChangeO_and_PostProcess_perf.log" 2>&1
+
+done
+
+# End time and date
+end_time=$(date +%s)
+end_date=$(date +"%Y-%m-%d %H:%M:%S")
+duration=$((end_time - start_time))
+hours=$((duration / 3600))
+minutes=$(( (duration % 3600) / 60 ))
+seconds=$((duration % 60))
+
+# Final report
+echo ">>> Pipeline ended at: $end_date"
+echo ">>> Total runtime: ${hours}h ${minutes}m ${seconds}s (${duration} seconds)"
+
+# nano > Copy paste the script from the shebang to the done of the loop > IgBlast_loop_all_samples.sh
+
+# As executable file
+chmod +x IgBlast_loop_all_samples.sh
+
+# run the loop as nohup so that it do not keyboad interupt when the session disconnect
+nohup ./IgBlast_loop_all_samples.sh > pipeline_log/IgBlast_loop_nohup__all_samples_log.txt 2>&1 &
+
+```
+
+## Post alignment processing
+
+All reads were aligned against IMGT referece with IgBlast 2 times, one to create an Ig DB, one to create a TR DB.
+
+Verify that reads are either assigned to IG or TR but not both ... Keep only Ig because Immunoverse experiment was performed only with Ig primers.
+
+Post process IgBlast alignment and create a log file.
+
+### Quality filters
+
+```{r,eval=FALSE}
+##Un comment it to save
+
+#dir.create(paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter"))
+
+```
+
+```{r,eval=FALSE}
+# Create a metadata data.frame to store the process pipeline results and create integrated plots
+
+# The ordered QC filters
+Var_to_collect <- c("IgBlast_input_reads",
+                    "Not_aligned_reads",
+                    "Ig_aligned_reverse_incorrect",
+                    "Ambiguous_Ig_Tr_aligned",
+                    "Too_many_N_in_VDJ",
+                    "Short_VDJ_alignment",
+                    "Unconsistent_VDJ_genes",
+                    "Unproductive_VDJ",
+                    "Junction_not_multiple_of_3",
+                    "Pass_Alignment_QC")
+
+Metadata_QC <- data.frame(matrix(NA,nrow = length(FileID),ncol = length(Var_to_collect)))
+rownames(Metadata_QC)<-FileID
+colnames(Metadata_QC)<-Var_to_collect
+
+# Open a file connection for writing a log file ##un comment if needed
+sink(paste0(ImmcantationFolder,"pipeline_log/","R_Immunoverse_IgBlast_Alignment_QualityFilter.log"), append = FALSE, type = c("output"))
+
+  t1<-Sys.time()
+  cat(paste("Start Alignment QC pipeline:",as.character(t1)))
+  #add space in the log
+  cat("\n")
+  cat("\n")
+
+for(file in FileID){
+
+  cat(file,"\n")
+  #create directory to store results per file
+  if(!file.exists(paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file))) dir.create(paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file)) 
+
+  # Do not need to adapt from here - path of R1 after clustering and renaming
+  file_path <- paste0(ImmcantationFolder,"03_ChangeO/01_IgBlast/",file)
+  
+  # Load airr from IgBlast alignment - Not collapsed file ...
+  options(readr.show_progress = FALSE)
+  DB_IG <- read_rearrangement(paste0(file_path,"_ig_igblast_db-pass.tsv"))
+  DB_TR <- read_rearrangement(paste0(file_path,"_tr_igblast_db-pass.tsv"))
+  
+  # Compute total number of reads aligned to Ig and to TR from input
+  ## Retrieve the number of seq used in input of MiXCR for the pipeline log
+  ## USe the bash command wc -l within R
+  
+  Input <- paste0(ImmcantationFolder,"03_ChangeO/01_IgBlast/",file,"_ready_to_align.fasta")
+  Input <- system(paste("wc -l", shQuote(Input)), intern = TRUE)
+  Input <- as.numeric(unlist(base::strsplit(Input,split = " "))[[1]] )
+  Input <- Input/2 #the command above retrieve the number of line in fasta. Divide by 2 to get the number of seq
+  cat(paste0("Reads in input for IgBlast (Insert only) : ",Input))
+  cat("\n")
+  Metadata_QC[file,"IgBlast_input_reads"]<-Input  # fill Metadata
+
+  ## Reads aligned to Ig with IgBlast
+  Num <- nrow(DB_IG)
+  Prop <- round((Num/Input)*100,2)
+  cat(paste0("Reads aligned to Ig with IgBlast : ",Num," (",Prop,"%)"))
+  cat("\n")
+  Metadata_QC[file,"Not_aligned_reads"]<-(Input-Num)  # fill Metadata
+  
+  ## Reads aligned to TR with IgBlast
+  Num <- nrow(DB_TR)
+  Prop <- round((Num/Input)*100,2)
+  cat(paste0("Reads aligned to TR with IgBlast : ",Num," (",Prop,"%)"))
+  cat("\n")
+  
+  # Reads should be aligned in forward orientation only
+  ## orientation in rev comp suggest an incorrect pre-processing of reads and thus an incorrect UMI attribution
+  ### Number of seq with incorrect Ig alignment orientation
+  Num <- sum((DB_IG$rev_comp))
+  PropIg <- round((Num/Input)*100,2)
+  cat(paste0("Reads aligned to Ig in Incorrect orientation (reverse) : ",Num," (",PropIg," %Ig)"))
+  cat("\n")
+
+  Metadata_QC[file,"Ig_aligned_reverse_incorrect"]<-Num  # fill Metadata
+  
+  ### Number of seq with incorrect TR alignment orientation
+  #Num <- sum((DB_TR$rev_comp))
+  #PropTR <- round((Num/nrow(DB_TR))*100,2)
+  #cat(paste0("Reads aligned to TR in Incorrect orientation (reverse) : ",Num," (",PropTR," %TR)"))
+  
+  
+  # Filter only reads aligned in right orientation (forward : inverse or rev_comp) and only for Ig or Tr
+  DB_IG <- DB_IG[!DB_IG$rev_comp,]
+  DB_TR <- DB_TR[!DB_TR$rev_comp,]
+  
+  # Compute number of reads aligned to both Ig and TR
+  if(sum(DB_IG$sequence_id %in% DB_TR$sequence_id)>0){
+    DB_IG_Intersect <- DB_IG[DB_IG$sequence_id %in% DB_TR$sequence_id,]
+    DB_IG_Intersect <- data.frame(DB_IG_Intersect)
+    rownames(DB_IG_Intersect)<-DB_IG_Intersect$sequence_id
+    DB_TR_Intersect <- DB_TR[DB_TR$sequence_id %in% DB_IG$sequence_id,]
+    DB_TR_Intersect <- data.frame(DB_TR_Intersect)
+    rownames(DB_TR_Intersect)<-DB_TR_Intersect$sequence_id
+    DB_TR_Intersect <- DB_TR_Intersect[rownames(DB_IG_Intersect),] # check that the order of row for both subset are the same
+    
+    ## check v score of Ig and Tr alignment (top score), same for j
+    TopVscore <- ifelse(DB_IG_Intersect$v_score < DB_TR_Intersect$v_score,
+           yes = "V-TR",
+           no = ifelse(DB_IG_Intersect$v_score == DB_TR_Intersect$v_score,
+                       yes ="V-ambiguous" ,
+                       no = "V-IG"))
+    TopJscore <- ifelse(DB_IG_Intersect$j_score < DB_TR_Intersect$j_score,
+           yes = "J-TR",
+           no = ifelse(DB_IG_Intersect$j_score == DB_TR_Intersect$j_score,
+                       yes ="J-ambiguous" ,
+                       no = "J-IG"))
+    ## Same for v/j_support. Lower value means better probability of correct match
+    ## check v score of Ig and Tr alignment (top score), same for j
+    LowVsupport <- ifelse(DB_IG_Intersect$v_support > DB_TR_Intersect$v_support,
+           yes = "Vsupport-TR",
+           no = ifelse(DB_IG_Intersect$v_support == DB_TR_Intersect$v_support,
+                       yes ="Vsupport-ambiguous" ,
+                       no = "Vsupport-IG"))
+    LowJsupport <- ifelse(DB_IG_Intersect$j_support > DB_TR_Intersect$j_support,
+           yes = "Jsupport-TR",
+           no = ifelse(DB_IG_Intersect$j_support == DB_TR_Intersect$j_support,
+                       yes ="Jsupport-ambiguous" ,
+                       no = "Jsupport-IG"))
+    
+    
+    ## Check Ig and Tr alignement length
+    ## SeqLen could be commented to keep memory/time
+    IGseq_len <- stri_count(DB_IG_Intersect[["sequence_alignment"]],regex="[^-.N]")
+    TRseq_len <- stri_count(DB_TR_Intersect[["sequence_alignment"]],regex="[^-.N]")
+    TopSeqLen <- ifelse(IGseq_len < TRseq_len,
+           yes = "SeqLen-TR",
+           no = ifelse(IGseq_len == TRseq_len,
+                       yes ="SeqLen-ambiguous" ,
+                       no = "SeqLen-IG"))
+    
+    
+    
+    Ig_Or_Tr_df <- data.frame(TopVscore=TopVscore,
+                              TopJscore=TopJscore,
+                              TopSeqLen=TopSeqLen,
+                              LowVsupport=LowVsupport,
+                              LowJsupport=LowJsupport,
+                              IgProd=ifelse(DB_IG_Intersect$productive,yes ="IG-Prod" ,no = "IG-NotProd"),
+                              IgInFrame=ifelse(DB_IG_Intersect$vj_in_frame,yes = "IG-InFrame",no = "IG-NotInFrame"),
+                              TrProd=ifelse(DB_TR_Intersect$productive,yes ="TR-Prod",no = "TR-NotProd"),
+                              TrInFrame=ifelse(DB_TR_Intersect$vj_in_frame,yes ="TR-InFrame",no = "TR-NotInFrame"))
+    
+    
+    Ig_Or_Tr_df$Collapse_only4Top <-paste(Ig_Or_Tr_df$TopVscore,Ig_Or_Tr_df$LowVsupport,Ig_Or_Tr_df$TopJscore,Ig_Or_Tr_df$LowJsupport,sep  = "_")
+    
+    # cat nb of correct Ambiguous / correct IG / correct TR
+    ## Total read with both alignment
+    Num <- nrow(Ig_Or_Tr_df)
+    PropIg <- round((Num/nrow(DB_IG))*100,2)
+    PropTR <- round((Num/nrow(DB_TR))*100,2)
+    cat(paste0("Reads aligned to TR as well as Ig with IgBlast : ",Num," (",PropIg," %Ig, ",PropTR, " %TR)"))
+    cat("\n")
+    
+    ## Ambiguous vs saved read
+    AmbiguousTable <- table(Ig_Or_Tr_df$Collapse_only4Top)
+    NumIg <- AmbiguousTable[["V-IG_Vsupport-IG_J-IG_Jsupport-IG"]]
+    ## There should be no true TR so this is commented (from SpatialVDJ approach)
+    #NumTr <- AmbiguousTable[["V-TR_Vsupport-TR_J-TR_Jsupport-TR"]]
+    NumAmbig <- sum(AmbiguousTable)-NumIg
+    PropIg <- round((NumIg/sum(AmbiguousTable))*100,2)
+    #PropTR <- round((NumTr/sum(AmbiguousTable))*100,2)
+    PropAmbig <- round((NumAmbig/sum(AmbiguousTable))*100,2)
+
+    cat(paste0("Reads aligned to TR as well as Ig with IgBlast - TRUE Ig : ",NumIg," (",PropIg,"%)"))
+    cat("\n")
+    #cat(paste0("Reads aligned to TR as well as Ig with IgBlast - TRUE Tr : ",NumTr," (",PropTR,"%)"))
+    cat(paste0("Reads aligned to TR as well as Ig with IgBlast - Ambiguous Ig-Tr : ",NumAmbig," (",PropAmbig,"%)"))
+    cat("\n")
+    
+     Metadata_QC[file,"Ambiguous_Ig_Tr_aligned"]<-NumAmbig  # fill Metadata
+
+    #DB_intersecet_retained
+    id_seq_true_ig <- DB_IG_Intersect$sequence_id[Ig_Or_Tr_df$Collapse_only4Top=="V-IG_Vsupport-IG_J-IG_Jsupport-IG"]
+    #id_seq_true_tr <- DB_TR_Intersect$sequence_id[Ig_Or_Tr_df$Collapse_only4Top=="V-TR_Vsupport-TR_J-TR_Jsupport-TR"]
+
+    DB_intersect_retained <- DB_IG[DB_IG$sequence_id %in% id_seq_true_ig,]
+    
+    # Concatenate DB_IG and DB_intersect_retained
+    ## For reads both Ig and Tr aligned, select top V score aligned to conclude as Ig or Tr. Remove ambiguous 
+    airr <- rbind(DB_IG[DB_IG$sequence_id %in% base::setdiff(DB_IG$sequence_id, DB_TR$sequence_id),], #Ig specific (not aligned to TR)
+                  # DB_TR[DB_TR$sequence_id %in% base::setdiff(DB_TR$sequence_id,DB_IG$sequence_id),], #Tr specific (not aligned to Ig)
+                  DB_intersect_retained)
+    
+  }else{
+    cat(paste0("Reads aligned to TR as well as Ig with IgBlast : ","0"," (","0"," %Ig, ","0", " %TR)"))
+    cat("\n")
+    cat(paste0("Reads aligned to TR as well as Ig with IgBlast - TRUE Ig : ","NA"," (","NA","%)"))
+    cat("\n")
+    #cat(paste0("Reads aligned to TR as well as Ig with IgBlast - TRUE Tr : ","NA"," (","NA","%)"))
+    cat(paste0("Reads aligned to TR as well as Ig with IgBlast - Ambiguous Ig-Tr : ","NA"," (","NA","%)"))
+    cat("\n")
+    
+         Metadata_QC[file,"Ambiguous_Ig_Tr_aligned"]<-0  # fill Metadata
+
+  }
+  
+  
+  Num <- nrow(airr)
+  cat(paste0("Sequences kept after filtering incorrect and ambiguous alignment : ",Num))
+  cat("\n")
+  
+  ######################################################################
+  # **Identify Reads with an Acceptable Number of Ambiguous Nucleotides - Max 10% N**
+  ## Identify Reads with an Acceptable Number of Ambiguous Nucleotides
+  ## Max 10% N
+  airr$num_n_inVDJ <- stri_count(airr[["sequence_alignment"]],fixed="N") 
+  
+  ## Plot the Num N nucleotide distribution
+  Plot1 <- ggplot(airr, aes(x = num_n_inVDJ)) +
+    geom_histogram(binwidth = 1, fill = "blue", color = "black", alpha = 0.7) +
+    labs(title = paste("Number of N per VDJ"), x = "Number of N in aligned sequence", y = "Frequency")+
+    theme_bw()
+  
+  ## Same in ratio
+  airr$seqVDJ_aligned_length <- stri_count(airr[["sequence_alignment"]],regex="[^-.]") # compute seq_len with N
+  airr$ratio_n_inVDJ <- airr$num_n_inVDJ/airr$seqVDJ_aligned_length
+  
+  ## Plot the ratio N nucleotide distribution
+  Plot2 <- ggplot(airr, aes(x = ratio_n_inVDJ)) +
+    geom_histogram(binwidth = 0.01, fill = "blue", color = "black", alpha = 0.7) +
+    labs(title = paste("Ratio of N per VDJ"), x = "Ratio of N in aligned sequence", y = "Frequency") +
+    geom_vline(xintercept = 0.1, linetype = "dotted", color = "blue", linewidth = 1) +
+    annotate("text", x = 0.1, y = Inf, label = "Quality filter\nLow N", color = "blue", vjust = +2.5,hjust = -0.1)+
+    scale_x_continuous(limits = c(-0.01,1.01))+
+    theme_bw()
+  
+  ##store results
+  ggsave(filename = paste0(res_folder,file,"_AlignedSeq_Num_and_Ratio_N.pdf"),plot = (Plot1|Plot2),width = 8,height = 4)
+
+  ##Filter and save table results
+  low_n <- airr$ratio_n_inVDJ <= 0.10
+  # no_n <- ratio_n==0
+  
+  Num <- sum(!low_n)
+  Prop <- round((Num/Input)*100,2)
+  cat(paste0("Filter vdj with more than 10% N : ",Num," (",Prop,"%)"))
+  cat("\n")
+
+  Metadata_QC[file,"Too_many_N_in_VDJ"]<-Num  # fill Metadata
+  
+  airr <- airr[low_n,] ## Keep only seq with ratio N <= 0.1 >> low_n TRUE
+  
+  ######################################################################
+  # **Identify Sequences with a Min length of 200 nt**
+  ### Identify Short Sequences
+  ### Compute sequence alignment length excluding dots
+  ## Min length 200 nt
+  airr$read_length <- stri_count(airr[["sequence"]],regex="[^-.]")
+  summary_length <- summary(airr$read_length)
+  
+  # cat("Long read length in input to IgBlast (only informative positions)")
+  # cat(summary_length) 
+   
+  Plot1 <- ggplot(airr, aes(x = read_length)) +
+    geom_histogram(binwidth = 1, fill = "blue", color = "black", alpha = 0.7) +
+    scale_x_continuous(limits = c(0,610))+
+    labs(title = paste("Read length in input to IgBlast"), x = "Input Sequence Length", y = "Frequency") +
+    # scale_y_log10()+
+     geom_vline(xintercept = summary_length["Mean"], linetype = "dashed", color = "red", linewidth = 1) +
+    annotate("label", x = summary_length["Mean"], y = Inf, label = paste("Average Length:", round(summary_length["Mean"], 2)), color = "red", vjust = +1,hjust = 0.5)+
+    theme_bw()
+
+  ## Same for aligned sequence without N (only informative bases)
+  airr$seqVDJ_aligned_length_noN <- stri_count(airr[["sequence_alignment"]],regex="[^-.N]")
+  summary_length <- summary(airr$seqVDJ_aligned_length_noN)
+  
+  ## Plot the sequence length distribution
+  Plot2 <- ggplot(airr, aes(x = seqVDJ_aligned_length_noN)) +
+    geom_histogram(binwidth = 1, fill = "blue", color = "black", alpha = 0.7) +
+    scale_x_continuous(limits = c(0,610))+
+    labs(title = paste("Aligned sequence (VDJ) length"),subtitle = "Gap and N excluded - Only informative", x = "Aligned Sequence Length", y = "Frequency") +
+    # scale_y_log10()+
+    geom_vline(xintercept = 200, linetype = "dotted", color = "blue", linewidth = 1) +
+    annotate("label", x = 200, y = Inf, label = "Quality filter\nlength>200b", color = "blue", vjust = +2.5,hjust = +1)+
+     geom_vline(xintercept = summary_length["Mean"], linetype = "dashed", color = "red", linewidth = 1) +
+    annotate("label", x = summary_length["Mean"], y = Inf, label = paste("Average Length:", round(summary_length["Mean"], 2)), color = "red", vjust = +1,hjust = 0.5)+
+    theme_bw()
+  
+  ##store results
+  ggsave(filename = paste0(res_folder,file,"_InputRead_and_AlignedSeqVDJnoN_length.pdf"),plot = Plot1/Plot2,width = 5,height = 7)
+  
+  #####  #####  Store an intermediate object containing only read and vdj no N length to create an integrated plot after the loop
+  Store_length<- airr[,c("read_length","seqVDJ_aligned_length_noN")]
+  Store_length$sampleid <- file
+  saveRDS(object = Store_length,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_not_filtered_read_and_vdj_seqlen.rds"))
+    #####   ##### 
+  
+  ##create a filter
+  long_seq <- airr$seqVDJ_aligned_length >= 200
+  
+  ##store results
+  Num <- sum(!long_seq)
+  Prop <- round((Num/Input)*100,2)
+  cat(paste0("Filter vdj alignment < 200 bases (no N or gap) : ",Num," (",Prop,"%)"))
+  cat("\n")
+
+  Metadata_QC[file,"Short_VDJ_alignment"]<-Num  # fill Metadata
+
+  airr <- airr[long_seq,] ## Keep only seq with vdj informative len >=200 >> long_seq TRUE
+
+  ######################################################################
+  # **Identify disagreements between the VDJC IgBLAST alignment**
+  ## Identify sequences with a disagreements between the V/J gene alignment and and the C gene IgBLAST alignment
+  ### Identify sequences with no C_call identify by IgBlast and remove them or tag chain and isotype as chain_NA
+  ## Keep reads with coherent gene, primer and isotype calls 
+
+  ## Compute disagreement
+  V_disagree_locus <-ifelse(getLocus(airr[["v_call"]]) == airr[["locus"]],yes = "same_locus",no = "V_different_from_locus")
+  
+  J_disagree_locus <-ifelse(getLocus(airr[["j_call"]]) == airr[["locus"]],yes = "same_locus",no = "J_different_from_locus")
+  
+  ##replace C_Call NA as paste(locus,NA)
+  airr$isotype <- gsub("\\*","",substr(airr[["c_call"]],1,5))
+  airr$isotype <- ifelse(test = is.na((airr[["isotype"]])),
+                                      yes = paste(airr[["locus"]],"NA",sep = "_"),
+                                      no = airr[["isotype"]])
+  
+  Isotype_disagree_locus <- ifelse(getLocus(airr[["isotype"]]) == airr[["locus"]],yes = "same_locus",no = "C_different_from_locus")
+  
+  same_locus <- (V_disagree_locus=="same_locus")  & (J_disagree_locus=="same_locus") & (Isotype_disagree_locus=="same_locus")
+  
+  ##store results
+  Num <- sum(!same_locus)
+  Prop <- round((Num/Input)*100,2)
+  cat(paste0("Filter inconsistent VDJ (e.g. VH and JK) : ",Num," (",Prop,"%)"))
+  cat("\n")
+  
+  Metadata_QC[file,"Unconsistent_VDJ_genes"]<-Num  # fill Metadata
+
+  airr <- airr[same_locus,] ## Keep only seq with consistent vdj >> same_locus TRUE
+
+  ######################################################################
+  # **Only productive sequences are kept**
+  ##If not already filtered, only productive sequences are kept
+  prod <- airr[["productive"]]
+
+  ##store results
+  Num <- sum(!prod)
+  Prop <- round((Num/Input)*100,2)
+  cat(paste0("Filter unproductive vdj : ",Num," (",Prop,"%)"))
+  cat("\n")
+  
+  Metadata_QC[file,"Unproductive_VDJ"]<-Num  # fill Metadata
+
+  airr <- airr[prod,] ## Keep only seq with productive vdj >> prod TRUE
+  
+  ######################################################################
+  # **Identify sequences with junction length multiple of three**
+  ### Identify sequences with junction length multiple of three
+  ## %% modulo operator
+  
+  m3 <- airr[["junction_length"]] %% 3 == 0
+  
+  Num <- sum(!m3)
+  Prop <- round((Num/Input)*100,2)
+  cat(paste0("Filter junction with length not modulo 3 : ",Num," (",Prop,"%)"))
+  cat("\n")
+  
+  Metadata_QC[file,"Junction_not_multiple_of_3"]<-Num  # fill Metadata
+  
+  airr <- airr[m3,] ## Keep only seq with junction modulo 3 >> m3 TRUE
+  
+  
+  ######################################################################
+  ### Count and save repertoire
+  Num <- nrow(airr)
+  Prop <- round((Num/Input)*100,2)
+  cat(paste0("Sequences kept after all QC filter : ",Num," (",Prop,"%)"))
+  cat("\n")
+  
+  Metadata_QC[file,"Pass_Alignment_QC"]<-Num  # fill Metadata
+  
+  # plot chain and proportion of reads (not deduplicated)
+
+  TableChain <- table(airr$locus)
+  Total <- sum(TableChain)
+
+  cat(paste0("Total READS identifying clone after quality filter (no deduplication): ",Total))
+  cat("\n")
+
+  Num<-ifelse(test = "IGH" %in% names(TableChain),yes = TableChain["IGH"],no = 0)
+  Prop <- round((Num/Total)*100,2)
+  cat(paste0("Total READS after all quality filter - IGH : ",Num," (",Prop,"%)"))
+  cat("\n")
+  
+  Num<-ifelse(test = "IGK" %in% names(TableChain),yes = TableChain["IGK"],no = 0)
+  Prop <- round((Num/Total)*100,2)
+  cat(paste0("Total READS after all quality filter - IGK : ",Num," (",Prop,"%)"))
+  cat("\n")
+  
+  Num<-ifelse(test = "IGL" %in% names(TableChain),yes = TableChain["IGL"],no = 0)
+  Prop <- round((Num/Total)*100,2)
+  cat(paste0("Total READS after all quality filter - IGL : ",Num," (",Prop,"%)"))
+  cat("\n")
+
+  
+  pal <- RColorBrewer::brewer.pal(n = 11,name = "Paired")
+  pal <- c(IGL=pal[[1]],
+           IGK=pal[[2]],
+           IGH=pal[[6]])
+  
+  
+  ## Plot chain percentage
+
+  TablePlot <- c("IGH"=0,"IGK"=0,"IGL"=0)
+  TablePlot[names(TableChain)] <-TableChain 
+
+  
+  pdf(paste0(res_folder,file,"_READS_after_all_quality_filter_Chain_proportion.pdf"),width = 5, height = 5) # Save a pie plot in pdf
+    pie(TablePlot, 
+        labels = paste0(names(TablePlot)," n=",TablePlot), 
+        main = "Chain proportion in READS after all quality filter", 
+        col = pal[names(TablePlot)])
+  invisible(dev.off()) # close the pdf device without printing the message in the sink  
+    
+  ##Un comment it to save
+  # 
+  write_rearrangement(airr,file=paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter.tsv"))
+  
+  cat("\n")
+
+  #keep some memory
+  ## remove all object but c("FileID","ImmcantationFolder","RawReadFolder","res_folder")
+  rm(list=setdiff(ls(),c("FileID","ImmcantationFolder","res_folder","t1","Metadata_QC")))
+  gc()
+  
+}
+
+  t2<-Sys.time()
+  cat(paste("Pipeline complete for all samples:",as.character(t2)))
+  cat("\n")
+  t2-t1
+  cat("\n")
+sink()
+
+# Save the Metadata in RDS to generate plot later
+## run on all sample
+saveRDS(object = Metadata_QC,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","Metadata_Step1_alignment_QC_All_samples.rds"))
+
+```
+
+### Chimeric reads
+
+#### Create Germlines
+
+```{bash,eval=F}
+# in a environment : conda activate pRESTO
+
+# put the script in a sh executable
+
+#!/bin/bash
+
+# Activate conda environment
+source PATH/conda.sh  # Adjust path if needed
+conda activate pRESTO
+
+Immcantation_dir="PATH/"
+
+cd ${Immcantation_dir}
+
+files=$(cat PATH/uniq_id_n104samples.txt)
+
+# Start timing
+start_time=$(date +%s)
+start_date=$(date +"%Y-%m-%d %H:%M:%S")
+echo ">>> Pipeline started at: $start_date"
+
+for file in $files; do
+
+  echo $file
+
+## Create Germlines : Input file WITHOUT any collapse duplicate 
+
+echo "Runing CreateGermlines.py"
+CreateGermlines.py -d "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}/${file}_igblast-db_quality_filter-allFilter.tsv" -r PATH/germlines/imgt/human/vdj -g dmask --format airr --outdir "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}/" >> "${Immcantation_dir}pipeline_log/${file}_ChangeO_and_PostProcess_perf.log" 2>&1
+
+done
+
+
+# End time and date
+end_time=$(date +%s)
+end_date=$(date +"%Y-%m-%d %H:%M:%S")
+duration=$((end_time - start_time))
+hours=$((duration / 3600))
+minutes=$(( (duration % 3600) / 60 ))
+seconds=$((duration % 60))
+
+# Final report
+echo ">>> Pipeline ended at: $end_date"
+echo ">>> Total runtime: ${hours}h ${minutes}m ${seconds}s (${duration} seconds)"
+
+# nano > Copy paste the script from the shebang to the done of the loop > CreateGermline_reads_loop_all_samples.sh
+
+# As executable file
+chmod +x CreateGermline_reads_loop_all_samples.sh
+
+# run the loop as nohup so that it do not keyboad interupt when the session disconnect
+nohup ./CreateGermline_reads_loop_all_samples.sh > pipeline_log/CreateGermline_reads_loop_nohup__all_samples_log.txt 2>&1 &
+
+```
+
+#### Chimeric read filtering
+
+```{r,eval=F}
+# Load a modified version of slideWindowDb to close the cluster at the end when nproc=12 (numeric) ...
+## if (stop_cluster & !is.numeric(nproc)) =>>> replaced by : if (stop_cluster). if nproc=12; then the statement was evaluated as False (!is.numeric(nproc)) and the cluster was not stropped ...
+#clear the session before running the following script. With 10 cores, it takes aroun 20-30 Go memory per iterations
+
+slideWindowDb_modif <- function(db, sequenceColumn="sequence_alignment",
+                          germlineColumn="germline_alignment_d_mask",
+                          mutThresh=6, windowSize=10, nproc=1){
+    # Hack for visibility of foreach index variables
+    i <- NULL
+    
+    # Check input
+    check <- checkColumns(db, c(sequenceColumn, germlineColumn))
+    if (check != TRUE) { stop(check) }
+
+    db <- db[,c(sequenceColumn, germlineColumn)]
+    # If the user has previously set the cluster and does not wish to reset it
+    if(!is.numeric(nproc)){
+        stop_cluster <- FALSE
+        cluster <- nproc
+        nproc <- 0
+    } else {
+        stop_cluster <- TRUE
+    }
+
+    # Ensure that the nproc does not exceed the number of cores/CPUs available
+    nproc <- min(nproc, cpuCount())
+
+    # If user wants to parallelize this function and specifies nproc > 1, then
+    # initialize and register slave R processes/clusters &
+    # export all necessary environment variables, functions and packages.
+    if (nproc == 1) {
+        # If needed to run on a single core/cpu then, register DoSEQ
+        # (needed for 'foreach' in non-parallel mode)
+        registerDoSEQ()
+    } else {
+        cluster_type <- "FORK"
+        if (.Platform$OS.type == "windows") {
+            cluster_type <- "PSOCK"
+        }
+        if (nproc != 0) {
+            #cluster <- makeCluster(nproc, type="SOCK")
+            cluster <- parallel::makeCluster(nproc, type= cluster_type)
+        }
+        parallel::clusterExport(cluster,
+                                    list('db', 'sequenceColumn', 'germlineColumn',
+                                         'mutThresh', 'windowSize','slideWindowSeq'),
+                                    envir=environment() )
+        registerDoParallel(cluster,cores=nproc)
+    }
+
+    filter <- unlist(foreach(i=1:nrow(db),
+                   .verbose=FALSE, .errorhandling='stop') %dopar% {
+                       slideWindowSeq(inputSeq = db[i, sequenceColumn],
+                                      germlineSeq = db[i, germlineColumn],
+                                      mutThresh = mutThresh,
+                                      windowSize = windowSize)
+                   })
+    if (stop_cluster) {
+        parallel::stopCluster(cluster)
+    }
+    filter
+
+}
+
+
+#Reload metadata
+## reload
+Metadata_QC <- readRDS(paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","Metadata_Step1_alignment_QC_All_samples.rds"))
+#  
+
+library(doParallel)
+```
+
+
+```{r,eval=F}
+# Open a file connection for writing a log file ##un comment if needed
+sink(paste0(ImmcantationFolder,"pipeline_log/","R_Immunoverse_IgBlast_Alignment_ChimericReadFilter.log"), append = FALSE, type = c("output"))
+
+  t1<-Sys.time()
+  cat(paste("Start chimeric filtering pipeline:",as.character(t1)))
+  #add space in the log
+  cat("\n")
+  cat("\n")
+
+
+for(file in FileID){
+  
+  cat(file)
+  cat("\n")
+  
+  # Do not need to adapt from here - path of Igblast quality filtered database
+  file_path <- paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass.tsv")
+  
+  # Load airr 
+  options(readr.show_progress = FALSE)
+  airr <- read_rearrangement(file_path)
+  
+  cat(paste("Start slideWindowDb_modif for file :",file))
+  cat("\n")
+  t11 <- Sys.time()
+  
+  is_chimeric <- slideWindowDb_modif(airr,sequenceColumn = "sequence_alignment", germlineColumn = "germline_alignment_d_mask", mutThresh=6,windowSize=10,nproc=30)
+  
+  t22 <- Sys.time()
+  t22-t11
+  
+  #filter out chimeric reads
+  Total <- nrow(airr)
+  airr <- airr[!is_chimeric,]
+  
+  Num<-nrow(airr)
+  Prop <- round((Num/Total)*100,2)
+  cat(paste0("Total READS after all Chimeric reads filtering : ",Num," (",Prop,"%)"))
+  cat("\n")
+   
+  ##### Fill metadata
+  ## first compute the numnber of reads which fail create germline.
+  Metadata_QC[file,"Fail_CreateGermline_reads"]<-Metadata_QC[file,"Pass_Alignment_QC"]-Total  # fill Metadata
+  ## then the number of reads which fail chimeric filter
+  Metadata_QC[file,"Ig_chimeric_reads"]<-sum(is_chimeric)  # fill Metadata
+
+  #####
+  
+  ##Un comment it to save
+  
+  write_rearrangement(airr,file=paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter.tsv"))
+
+  #keep some memory
+  ## remove all object but c("FileID","ImmcantationFolder","RawReadFolder","res_folder")
+  rm(list=setdiff(ls(),c("FileID","ImmcantationFolder","res_folder","slideWindowDb_modif","Metadata_QC","t1")))
+  gc()
+  
+  cat("\n")
+
+}
+  t2<-Sys.time()
+  cat(paste("Pipeline complete for all samples:",as.character(t2)))
+  cat("\n")
+  t2-t1
+  cat("\n")
+sink()
+
+# Save the Metadata in RDS to generate plot later
+# saveRDS(object = Metadata_QC,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","Metadata_Step2_ChimericFilter_All_samples.rds"))
+
+# compute chimeric_filter_pass (forgot to add it in the pipeline before)
+Metadata_QC$Pass_Chimeric_QC<-NA
+
+for(file in FileID){
+  airr <-read_rearrangement(paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter.tsv"))
+  Metadata_QC[file,"Pass_Chimeric_QC"]<-nrow(airr)
+}  
+
+# Save the Metadata in RDS to generate plot later
+saveRDS(object = Metadata_QC,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","Metadata_Step2_ChimericFilter_All_samples.rds"))
+
+```
+
+
+### Collapse duplicates
+
+```{r,eval=FALSE}
+#Reload metadata
+## reload from the step 2 (chimeric filter) for all 105 samples
+Metadata_QC <- readRDS( paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","Metadata_Step2_ChimericFilter_All_105samples.rds"))
+```
+
+
+```{r,eval=F}
+
+# Open a file connection for writing a log file ##un comment if needed
+sink(paste0(ImmcantationFolder,"pipeline_log/","R_Immunoverse_IgBlast_Alignment_CollapseDuplicates.log"), append = FALSE, type = c("output"))
+
+  t1<-Sys.time()
+  cat(paste(">>> Pipeline started :",t1))
+  cat("\n")
+  cat("Collapse duplicates group :",paste(c("v_gene","j_gene","cdr3","isotype","productive"),collapse = ","))
+  cat("\n")
+  cat("\n")
+  
+for(file in FileID){
+  
+  cat(file)
+  cat("\n")
+  
+  # Do not need to adapt from here - path of Igblast quality filtered database
+  file_path <- paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter.tsv")
+  
+  # Load airr 
+  options(readr.show_progress = FALSE)
+  airr <- read_rearrangement(file_path)
+  
+  Input <- nrow(airr)
+  cat(paste0("Total reads in input (before collapse duplicates) : ",Input))
+  cat("\n")
+  
+  # Start Collapse Duplicates
+  
+  cat(paste("Start collapseDuplicates for file :",file))
+  cat("\n")
+  
+  t11 <- Sys.time()
+
+    ## Collapse group : same v_gene, j_gene, CDR3, isotype, productive 
+  ### WITHOUT UMI to collapse group because I want to define clonotype based on identical CDR3 on all the repertoire (quite similar to MiXCR ...). 
+  collapse_groups <- c("v_gene","j_gene","cdr3","isotype","productive")
+  
+  airr <- airr %>% 
+      mutate(v_gene=getGene(v_call), j_gene=getGene(j_call)) %>% 
+      group_by(.dots=collapse_groups) 
+  
+  CollapseGroup=group_indices(airr) # retrieve id of all collapse group
+  
+  airr <- airr %>%
+    ungroup %>%
+    mutate(CollapseGroupId=paste0("GroupId",CollapseGroup)) ## Add a groupID column
+  
+  
+  ## Collapse duplicate with dry=TRUE to tag collapsing group and notably add a collapse_id column but do not deleted the sequences
+  pbapply::pboptions(type = "none")
+
+  airr <- airr %>%
+  group_by(across(all_of(collapse_groups))) %>%
+  group_modify(~ {
+    collapsed_data <- collapseDuplicates(.x,  id = "sequence_id", seq = "sequence_alignment", text_fields = NULL, num_fields = NULL, seq_fields = NULL, add_count = FALSE, ignore = c("N", "-", ".", "?"), sep = ",", dry = TRUE, verbose = FALSE)
+    collapsed_data$collapse_id <- paste0("CollapseId", as.character(collapsed_data$collapse_id))# Convert collapse_id to character type
+    collapsed_data
+  }) %>%
+  ungroup()
+  
+  # Create a clonotype_id column by concatenating GroupId and CollapseId
+  airr$clonotype_id <- paste(airr$CollapseGroupId,airr$collapse_id,sep = "_")
+
+  Num <- sum(airr$collapse_class != "ambiguous")
+  Prop <- round((Num/nrow(airr))*100,2)
+  cat(paste0("Total reads with not ambiguous clonotype defined : ",Num," (",Prop,"%)"))
+  cat("\n")
+  
+  ##### Fill metadata
+  Metadata_QC[file,"Ambiguous_clonotype_reads"]<-sum(airr$collapse_class == "ambiguous")  # fill Metadata
+  
+  ##### Correct PCR error leading to false diversity :
+  ##### Same UMI in different clonotypes of same group (same V, J, cdr3, Isotype) suggest of PCR error
+  airr <- airr[airr$collapse_class != "ambiguous",]
+
+  # Count Nb of unique umi per clonotype_id 
+  ## Because of low diversity : the same UMI can be found in different clonotypes.
+  ## BUT : 2 Different clonotypes of the same group  (same V, J, cdr3, Isotype) suggest PCR error
+  Clone_PerUMI <- tapply(airr$clonotype_id,airr$barcode,table)
+  
+  Read_PerClone <- table(airr$clonotype_id)
+  
+  Group_PerUMI <- lapply(Clone_PerUMI,function(cln){
+    GroupIdDuplicated <- gsub("_.*","",names(cln))
+    tapply(names(cln),GroupIdDuplicated,function(cln)cln,simplify = F)
+  })
+  
+  ## search the ID of the cln for which the count is the highest and thus should be kept, the reads in other cln should be filtered
+
+  library(parallel)
+  clust <- makeCluster(32)
+  clusterExport(clust, "Read_PerClone")
+  clusterExport(clust, "Group_PerUMI")
+  
+  airr$PCRbias <- parApply(cl = clust,airr,1,function(read){
+    cln <- read[["clonotype_id"]]
+    umi <- read[["barcode"]]
+    group <- read[["CollapseGroupId"]]
+    
+    ListClonoToTest <- Group_PerUMI[[umi]][[group]]
+    
+    L<-length(ListClonoToTest)
+      if(L==1){
+        res <- "To_keep"
+      }else{
+        #The clonotype with the highest number of read is probably the true one ...
+        Count <- Read_PerClone[ListClonoToTest]
+        Max <- max(Count)
+        if(sum(Count==Max)>1){
+          res <-"MultipleMax"
+        }else{
+          res <- ifelse(Read_PerClone[[cln]] == Max,yes = "To_keep",no = "To_filter")
+        }
+      }
+      res
+  })
+  
+
+  stopCluster(clust)
+  
+  
+  Num <- sum(airr$PCRbias == "To_keep")
+  Prop <- round((Num/nrow(airr))*100,2)
+  cat(paste0("Total reads after filter PCR bias : ",Num," (",Prop,"%)"))
+  cat("\n")
+  
+  ##### Fill metadata
+  Metadata_QC[file,"PCR_bias_filtered_reads"]<-sum(airr$PCRbias != "To_keep")  # fill Metadata
+  
+  airr <- airr[airr$PCRbias == "To_keep",]
+ 
+  BeforeCollapse <- nrow(airr)
+  
+  airr <- airr %>%
+    group_by(across(all_of(collapse_groups))) %>%
+    group_modify(~ collapseDuplicates(
+      .x,
+      id = "sequence_id",
+      seq = "sequence_alignment",
+      text_fields = c("barcode", "clonotype_id"),
+      num_fields = NULL,
+      seq_fields = NULL,
+      add_count = TRUE,
+      ignore = c("N", "-", ".", "?"),
+      sep = ",",
+      dry = FALSE,
+      verbose = FALSE
+    )) %>%
+    ungroup() %>%
+    mutate(read_count = as.numeric(collapse_count)) %>%  # convert in numeric if necessary and rename in read_count
+    mutate(unique_umi = barcode) %>%                      # rename
+    select(-CollapseGroupId, -collapse_id, -collapse_class,
+           -collapse_pass, -collapse_count, -PCRbias, -barcode)  # remove unecessary columns
+
+  
+  t22 <- Sys.time()
+  TimeDiff<-t22-t11
+  cat("Collapse duplicate sequences run time",paste(round(as.numeric(TimeDiff),2), attr(TimeDiff, "units")))
+  cat("\n")
+
+  # Add Nb umi to final repertoire
+  airr$umi_count <- 1+str_count(airr$unique_umi,",")
+  
+  # Re-order the final repertoire table by umi_count per clone to have a repertoire ordered in the same way as MiXCR (top counted clone is first, etc)
+  ## And rename clonotype_id accordingly (clonotype_id = chain + clone + n°)
+  airr <- airr[order(airr$umi_count,decreasing = T),]
+  
+  airr$clonotype_id <- paste0(airr$locus,"clonotype",0:(nrow(airr)-1)) #adapt clonotype_id
+
+  # Save the repertoire data after collapse duplicates
+  AfterCollapse <- nrow(airr)
+  Num<-AfterCollapse
+  Prop <- round((Num/Input)*100,2)
+  cat(paste0("Total CLONOTYPE after collapse duplicated reads : ",Num," (",Prop,"% input reads)"))
+  cat("\n")
+
+  ##### Fill metadata
+  Metadata_QC[file,"Duplicate_reads"]<-BeforeCollapse-AfterCollapse  # fill Metadata
+  
+  ## Plot distribution of read count before filtering and summary 
+  
+  Plot <- ggplot(airr, aes(x = read_count)) +
+            geom_histogram(binwidth = 1, fill = "blue", color = "black", alpha = 0.7) +
+            labs(title = paste("Read count distribution per unique sequence","-","Before filtering" ), x = "Read count", y = "Nb of unique sequences")+
+            scale_y_continuous(trans = "log1p", breaks=c(0,1,10,100,1000,5000,10000)) + theme(panel.grid.minor = element_blank())
+  theme_bw()
+
+  ##store results
+  ggsave(filename = paste0(res_folder,file,"_CollapseSeq_ReadCount_distrib_beforeFilter.pdf"),plot = Plot,width = 7,height = 5)
+
+  Plot <- ggplot(airr, aes(x = umi_count)) +
+            geom_histogram(binwidth = 1, fill = "blue", color = "black", alpha = 0.7) +
+            labs(title = paste("UMI count distribution per unique sequence","-","Before filtering" ), x = "UMI count", y = "Nb of unique sequences")+
+            scale_y_continuous(trans = "log1p", breaks=c(0,1,10,100,1000,5000,10000)) + theme(panel.grid.minor = element_blank())+
+  theme_bw()
+
+  ##store results
+  ggsave(filename = paste0(res_folder,file,"_CollapseSeq_UMICount_distrib_beforeFilter.pdf"),plot = Plot,width = 7,height = 5)
+  
+   #####  #####  Store an intermediate object containing only read and umi count to create an integrated plot after the loop
+  Store_count<- airr[,c("read_count","umi_count")]
+  Store_count$sampleid <- file
+  saveRDS(object = Store_count,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_Collapse_duplicates_clonotypes_read_umi_count.rds"))
+    #####   ##### 
+  
+  
+#Same save but after filtering umi count 2
+  AfterCollapseFilter2 <- airr[airr$umi_count > 1,]
+  Num<-nrow(AfterCollapseFilter2)
+  Prop <- round((Num/Input)*100,2)
+  cat(paste0("Total CLONOTYPE after filter min 2 UMI counts : ",Num," (",Prop,"%)"))
+  cat("\n")
+  
+  ##### Fill metadata
+  Metadata_QC[file,"Only_1umi_clonotypes"]<-AfterCollapse-Num  # fill Metadata
+  Metadata_QC[file,"Final_clonotypes"]<-Num  # fill Metadata
+
+  # Print number of unique final clone per chain
+  
+  ### ON FILTERED TABLE 
+  TableChain <- table(AfterCollapseFilter2$locus) #### AfterCollapseFilter2 or airr
+  Total <- sum(TableChain)
+  
+  cat(paste0("Total CLONOTYPE after all quality filter : ",Total))
+  cat("\n")
+  
+  Num<-ifelse(test = "IGH" %in% names(TableChain),yes = TableChain["IGH"],no = 0)
+  Prop <- round((Num/Total)*100,2)
+  cat(paste0("Total CLONOTYPE after all quality filter - IGH : ",Num," (",Prop,"%)"))
+  cat("\n")
+  Metadata_QC[file,"Final_clonotypes_IGH"]<-Num  # fill Metadata
+  
+  Num<-ifelse(test = "IGK" %in% names(TableChain),yes = TableChain["IGK"],no = 0)
+  Prop <- round((Num/Total)*100,2)
+  cat(paste0("Total CLONOTYPE after all quality filter - IGK : ",Num," (",Prop,"%)"))
+  cat("\n")
+  Metadata_QC[file,"Final_clonotypes_IGK"]<-Num  # fill Metadata
+  
+  Num<-ifelse(test = "IGL" %in% names(TableChain),yes = TableChain["IGL"],no = 0)
+  Prop <- round((Num/Total)*100,2)
+  cat(paste0("Total CLONOTYPE after all quality filter - IGL : ",Num," (",Prop,"%)"))
+  cat("\n")
+  Metadata_QC[file,"Final_clonotypes_IGL"]<-Num  # fill Metadata
+  
+  pal <- RColorBrewer::brewer.pal(n = 11,name = "Paired")
+  pal <- c(IGL=pal[[1]],
+           IGK=pal[[2]],
+           IGH=pal[[6]])
+  
+  
+  ## Plot chain percentage
+
+  TablePlot <- c("IGH"=0,"IGK"=0,"IGL"=0)
+  TablePlot[names(TableChain)] <-TableChain 
+  TablePlotProp<-round((TablePlot/sum(TablePlot))*100,0)
+  
+  pdf(paste0(res_folder,file,"_CLONOTYPE_after_all_quality_filter_Chain_proportion.pdf"),width = 6, height = 5) # Save a pie plot in pdf
+    pie(TablePlot, 
+        labels = paste0(names(TablePlot)," n=",TablePlot,"(",TablePlotProp,"%)"), 
+        main = "Chain proportion after all quality filter", 
+        col = pal[names(TablePlot)])
+  invisible(dev.off()) # close the pdf device without printing the message in the sink  
+    
+  
+
+  ## Write final repertoire table 
+  write_rearrangement(airr,file=paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_Collapse-unique_All-kept.tsv"))
+
+  write_rearrangement(AfterCollapseFilter2,file=paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_Collapse-unique_at-least2-count.tsv"))
+
+
+  #keep some memory
+  ## remove all object but c("FileID","ImmcantationFolder","RawReadFolder","res_folder")
+  rm(list=setdiff(ls(),c("FileID","ImmcantationFolder","res_folder","collapse_groups","t1","Metadata_QC")))
+  gc()
+  
+  cat("\n")
+}
+
+  t2<-Sys.time()
+  cat(paste(">>> Pipeline complete for all samples:",t2))
+  cat("\n")
+  DiffGlobal<-t2-t1
+  cat(">>> Total runtime:",paste(round(as.numeric(DiffGlobal),2), attr(DiffGlobal, "units")))
+  cat("\n")
+  cat("\n")
+  
+sink()
+
+
+# Save the Metadata in RDS to generate plot later
+saveRDS(object = Metadata_QC,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","Metadata_Step3_CollapseDuplicates_All_105samples.rds"))
+```
+
+```{r,eval=FALSE}
+# EDIT :: Reload Step3 metadata to add IGH isotypes counts per samples > to add in the report
+Metadata_QC <- readRDS( paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","Metadata_Step3_CollapseDuplicates_All_105samples.rds"))
+
+# Loop to reload the last table with final clonotypes and compute the number of clonotypes for each IGH isotypes
+for(file in FileID){
+  print(file)
+  
+  airr<-read_rearrangement(paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_Collapse-unique_at-least2-count.tsv"))
+  
+  # order IGH
+  Order <- c("IGHM","IGHD","IGHG3","IGHG1","IGHA1","IGHG2","IGHG4","IGHE","IGHA2","IGH_NA")
+  
+  #Table isotypes
+  TableIso <- table(airr$isotype)
+
+  #fill all isotypes in the order on chromosomes
+  for(iso in Order){
+    Num<-ifelse(test = iso %in% names(TableIso),yes = TableIso[iso],no = 0)
+    Metadata_QC[file,paste("Final_clonotypes",iso,sep = "_")]<-Num  # fill Metadata
+  }
+  
+  #keep some memory
+  ## remove all object but c("FileID","ImmcantationFolder","RawReadFolder","res_folder")
+  rm(list=setdiff(ls(),c("FileID","ImmcantationFolder","res_folder","Metadata_QC")))
+  gc()
+}
+
+# Save the Metadata in RDS to generate plot later
+saveRDS(object = Metadata_QC,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","Metadata_Step3_CollapseDuplicates_All_105samples_WithIGHisotypes.rds"))
+
+```
+
+
+### Clustering sequences into clonal groups
+
+For the file collapsed unique and after filtering 2 UMI Count
+
+#### Calculate the Distance to the Nearest Distribution and find a threshold
+
+```{r,eval=F}
+  #create directory to store results per file
+  if(!file.exists(paste0(res_folder,"Clone_Dist_Threshold"))) dir.create(paste0(res_folder,"Clone_Dist_Threshold")) 
+
+# Open a file connection for writing a log file ##un comment if needed
+sink(paste0(ImmcantationFolder,"pipeline_log/","R_Immunoverse_IgBlast_Alignment_NearestNeighbor.log"), append = FALSE, type = c("output"))
+
+  t1<-Sys.time()
+  cat(paste(">>> Pipeline started :",t1))
+  cat("\n")
+
+  list_plot<-list()
+  
+for(file in FileID){
+  
+  cat(file)
+  cat("\n")
+  
+  # Do not need to adapt from here - path of Igblast quality filtered database
+  file_path <- paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_Collapse-unique_at-least2-count.tsv")
+  
+  # Load airr 
+  options(readr.show_progress = FALSE)
+  airr <- read_rearrangement(file_path)
+  
+  airr_heavy <- airr %>%
+  filter(locus == "IGH")
+  
+  cat("Start")
+  cat("\n")
+  t11 <- Sys.time()
+  
+  # Open a file connection for writing a log file ##un comment if needed
+  sink(paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igh_dist_nearest_and_threshold_log.txt"), append = FALSE, type = c("output"))
+  
+  cat(paste("Number of unique IGH clonotypes :",nrow(airr_heavy)))
+  cat("\n")
+  
+  cat(paste("Start distToNearest for file :",file))
+  cat("\n")
+  airr_heavy <- distToNearest(airr_heavy, sequenceColumn="junction",vCallColumn="v_call", jCallColumn="j_call", model="ham", first=FALSE, normalize="len", nproc=20)
+
+  cat(paste("Start findThreshold for file :",file))
+  cat("\n")
+  
+  threshold <- try(findThreshold(airr_heavy[["dist_nearest"]], method="density"),silent = T)
+  if (inherits(threshold, "try-error")){
+    clone_threshold <- NA
+  }else{
+    clone_threshold <- round(threshold@threshold,digits = 2) 
+  }
+  
+  cat(paste("findThreshold - density method - round 2 digits :",clone_threshold))
+  cat("\n")
+  
+  # Close the sink connection to save the output to the file ## un comment if needed
+  sink()
+  
+  #Save the plot
+  if (inherits(threshold, "try-error")){
+    error_message <- conditionMessage(attr(threshold, "condition"))  # Extract error message
+    # Create a text-based ggplot with the error message
+    p <- ggplot() +
+      annotate("text", x = 0.5, y = 0.5, label = error_message, size = 2, hjust = 0.5) +
+      theme_void()+ # Remove axes and background
+      labs(title = file) 
+    
+    ggsave(filename = paste0(res_folder,"Clone_Dist_Threshold/",file,"_Hamming_length_normalized_igh_threshold.pdf"),
+           plot = p,
+           width =3 ,height =2 )
+  }else{
+    p<-plot(threshold, binwidth=0.02, silent=T)+
+      labs(title = file)
+  
+    ggsave(filename = paste0(res_folder,"Clone_Dist_Threshold/",file,"_Hamming_length_normalized_igh_threshold.pdf"),
+           plot = p,
+           width =3 ,height =2 )
+  }
+
+  list_plot[[file]]<-p
+  # Save the repertoire data after collapse duplicates
+  write_rearrangement(airr_heavy, file=paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_Collapse-unique_at-least2-count_IGH-dist.tsv"))
+  
+  t22 <- Sys.time()
+  Diff<-t22-t11
+  cat(file,">>> Total runtime:",paste(round(as.numeric(Diff),2), attr(Diff, "units")))
+  cat("\n")
+  
+  cat("End")
+  cat("\n")
+  
+  rm(list=setdiff(ls(),c("FileID","ImmcantationFolder","res_folder","t1","list_plot")))
+  gc()
+  
+}
+
+  t2<-Sys.time()
+  cat(paste(">>> Pipeline complete for all samples:",t2))
+  cat("\n")
+  DiffGlobal<-t2-t1
+  cat(">>> Total runtime:",paste(round(as.numeric(DiffGlobal),2), attr(DiffGlobal, "units")))
+  cat("\n")
+  cat("\n")
+  
+sink()
+
+#global plot on 105 samples
+patch<-patchwork::wrap_plots(list_plot)
+ggsave(filename = paste0(res_folder,"Clone_Dist_Threshold/","Global_Patchork_allSamples_Hamming_length_normalized_igh_threshold.pdf"),
+     plot = patch,
+     width =25 ,height =17)
+  
+```
+
+#### Define clones
+
+Define clone according to previously defined threshold. Create germline according to clone information.
+
+```{bash,eval=F}
+# put the script in a sh executable
+
+#!/bin/bash
+
+# Activate conda environment
+source PATH/conda.sh  # Adjust path if needed
+conda activate pRESTO
+
+Immcantation_dir="PATH/"
+
+cd ${Immcantation_dir}
+
+files=$(cat PATH/uniq_id_n105samples.txt)
+
+# Start timing
+start_time=$(date +%s)
+start_date=$(date +"%Y-%m-%d %H:%M:%S")
+echo ">>> Pipeline started at: $start_date"
+
+for file in $files; do
+
+  echo $file
+  
+  
+  Threshlog="${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}/${file}_igh_dist_nearest_and_threshold_log.txt"
+
+  threshold=`grep "findThreshold - density method - round 2 digits : " $Threshlog | sed "s/findThreshold.*: //g"`
+  
+    # If threshold is NA or threshold is greater than 0.15, then replace by 0.15
+  if [[ "$threshold" == "NA" || $(echo "$threshold > 0.15" | bc -l) -eq 1 ]]; then
+    threshold=0.15
+  fi
+  
+echo "Runing DefineClones.py"
+DefineClones.py -d "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}/${file}_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_Collapse-unique_at-least2-count_IGH-dist.tsv" --model ham --norm len --dist $threshold --mode gene --act set --nproc 20 --outdir "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}/" --format airr --log "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}/${file}_DefineClone.log" >> "${Immcantation_dir}pipeline_log/${file}_ChangeO_and_PostProcess_perf.log" 2>&1
+
+echo "Runing CreateGermlines.py"
+CreateGermlines.py -d "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}/${file}_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_Collapse-unique_at-least2-count_IGH-dist_clone-pass.tsv" -r PATH/germlines/imgt/human/vdj -g dmask --format airr --cloned --outdir "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}/" >> "${Immcantation_dir}pipeline_log/${file}_ChangeO_and_PostProcess_perf.log" 2>&1
+
+done
+
+
+# End time and date
+end_time=$(date +%s)
+end_date=$(date +"%Y-%m-%d %H:%M:%S")
+duration=$((end_time - start_time))
+hours=$((duration / 3600))
+minutes=$(( (duration % 3600) / 60 ))
+seconds=$((duration % 60))
+
+# Final report
+echo ">>> Pipeline ended at: $end_date"
+echo ">>> Total runtime: ${hours}h ${minutes}m ${seconds}s (${duration} seconds)"
+
+# nano > Copy paste the script from the shebang to the done of the loop > DefineClones_loop_all_samples.sh
+
+# As executable file
+chmod +x DefineClones_loop_all_samples.sh
+
+# run the loop as nohup so that it do not keyboad interupt when the session disconnect
+nohup ./DefineClones_loop_all_samples.sh > pipeline_log/DefineClones_loop_nohup__all_samples_log.txt 2>&1 &
+
+
+```
+
+### Clonal lineage tree analysis
+
+```{r,eval=FALSE}
+library(dowser)
+library(alakazam)
+library(airr)
+library(dplyr)
+
+#Reload metadata
+## reload from the step 3 (Collapse Duplicates) for all 105 samples
+Metadata_QC <- readRDS( paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","Metadata_Step3_CollapseDuplicates_All_105samples.rds"))
+
+# Add in the Metadata the threshold of nearest distance inferred for clonal grouping by density method / the threshold applied if modified
+
+for(file in FileID){
+  Threshlog <- read.delim(paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igh_dist_nearest_and_threshold_log.txt"),header = F,sep = ":")
+  thresh<-as.numeric(gsub(" ","",Threshlog[grepl("density",Threshlog$V1),"V2"])) # take the threshold, remove space, convert numeric
+  Metadata_QC[file,"Threshold_IGHclonal_grouping_inferred"]<-thresh
+  
+  if(is.na(thresh)){
+    Metadata_QC[file,"Threshold_IGHclonal_grouping_applied"]<-0.15
+  }else{
+    if(thresh>0.15){
+      Metadata_QC[file,"Threshold_IGHclonal_grouping_applied"]<-0.15
+    }else{
+      Metadata_QC[file,"Threshold_IGHclonal_grouping_applied"]<-thresh
+    }
+  }
+}
+```
+
+```{r,eval=F}
+
+# Open a file connection for writing a log file ##un comment if needed
+sink(paste0(ImmcantationFolder,"pipeline_log/","R_Immunoverse_IGH_clonal_lineage_tree_dowser.log"), append = FALSE, type = c("output"))
+
+  t1<-Sys.time()
+  cat(paste(">>> Pipeline started :",t1))
+  cat("\n")
+
+for(file in FileID){
+  
+  cat(file)
+  cat("\n")
+  
+  cat("Start")
+  cat("\n")
+  t11 <- Sys.time()
+  
+  # Do not need to adapt from here - path of Igblast quality filtered database
+  file_path <- paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_Collapse-unique_at-least2-count_IGH-dist_clone-pass_germ-pass.tsv")
+  
+  # Load airr 
+  options(readr.show_progress = FALSE)
+  airr <- read_rearrangement(file_path)
+  
+  # Compute for the Metadata
+  Num<-length(unique(airr$clone_id))
+  cat(paste("number of unique clone_id :",Num))
+  cat("\n")
+
+  ##### Fill metadata
+  Metadata_QC[file,"IGH_clones_Total"]<-Num  # fill Metadata
+  
+  # 1. Format
+  
+  airr$read_count <- as.numeric(airr$read_count)
+  airr$umi_count <- as.numeric(airr$umi_count)
+  
+  clones <- try(formatClones(airr, traits=c("isotype"),num_fields=c("read_count","umi_count"),text_fields = c("clonotype_id","unique_umi"), columns=c("d_call"), minseq=2,nproc=20),
+                silent = T)
+  if (inherits(clones, "try-error")){
+    # 0 clones with 2 clonotypes
+    cat(paste("IGH clone with more than 1 clonotype :","0"))
+    cat("\n")
+    ##### Fill metadata
+    Metadata_QC[file,"IGH_clones_with_more_1clonotype"]<-0  # fill Metadata
+    
+    # Num totol = num clones with 1 clonotypes
+    cat(paste("IGH clone with only 1 clonotype :",Num))
+    cat("\n")
+    ##### Fill metadata
+    Metadata_QC[file,"IGH_clones_with_only_1clonotype"]<-Num  # fill Metadata
+  }else{
+    # Num_clones_more than 1 seq
+    Num_more1seq <- nrow(clones)
+    cat(paste("IGH clone with more than 1 clonotype :",Num_more1seq))
+    cat("\n")
+    ##### Fill metadata
+    Metadata_QC[file,"IGH_clones_with_more_1clonotype"]<-Num_more1seq  # fill Metadata
+    
+    # Only 1 seq = Num total - Num more than 1  
+    Num_only1seq <-Num - Num_more1seq
+    cat(paste("IGH clone with only 1 clonotype :",Num_only1seq))
+    cat("\n")
+    ##### Fill metadata
+    Metadata_QC[file,"IGH_clones_with_only_1clonotype"]<-Num_only1seq  # fill Metadata
+    
+    # 2. Build the Trees
+    # build maximum parsimony trees 
+    clones <- getTrees(clones,nproc = 20)
+    # clones <- scaleBranches(clones, edge_type = "mutations") # make a scale in mutations number (easier to interprete)
+  
+    # 3. Visualize
+    # Plot the trees. Save them in a list of plots. 
+    # Use tip metadata: isotype and collapse_count
+    
+    color_palette <- c("IGHM"="#253494", "IGHD"="#1D91C0", "IGHG1"="#d62728", "IGHG2"="#ff7f0e",  "IGHG3"="#FF6EC7", "IGHG4"="#FCCF05", "IGHA1"="#2ca02c", "IGHA2"="#36e40a","IGHE"="#8c564b","IGH_NA"="grey")
+    
+    tree_plots <- plotTrees(clones, tips="isotype", tipsize="umi_count", tip_palette=c(color_palette, "Germline"="#000000"),layout = "roundrect")
+    names(tree_plots)<-paste0("IGHclone",clones$clone_id)
+    
+    ## Convert as dendrogram and save
+    tree_plots <- lapply(tree_plots,function(plot){
+      plot<-plot+
+        ggtree::layout_dendrogram() # switch as a dendrogram with germline in the top
+      
+      plot
+    })
+
+    ####folder to save plot
+  if(!file.exists(paste0(res_folder,"IGHclones/",file))) dir.create(paste0(res_folder,"IGHclones/",file)) 
+    ### Save in the R session only the top 10 max, do not save for now the plot in pdf but keep the full object in RDS for latter plot saving if necessary
+    if(length(tree_plots)>10){
+      for(clnID in names(tree_plots)[1:10]){
+        plot<-tree_plots[[clnID]]
+        ggsave(plot = plot,
+             filename = paste0(res_folder,"IGHclones/",file,"/","Dowser_MaxParsimonyTree_",clnID,".pdf"),
+             width = 8,height = 4)
+      }
+    }else{
+      for(clnID in names(tree_plots)){
+        plot<-tree_plots[[clnID]]
+        ggsave(plot = plot,
+             filename = paste0(res_folder,"IGHclones/",file,"/","Dowser_MaxParsimonyTree_",clnID,".pdf"),
+             width = 8,height = 4)
+      }
+    }
+    
+    #Save the RDS in 03_ChangeO/02_PostIgBlastFilter
+    qsave(clones,paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_Dowser_MaxParsimonyTree_igh_clones_datatable.qs"))
+    qsave(tree_plots, paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_Dowser_MaxParsimonyTree_igh_clones_treePlot.qs"))
+  }
+
+  t22 <- Sys.time()
+  Diff<-t22-t11
+  cat(file,">>> Total runtime:",paste(round(as.numeric(Diff),2), attr(Diff, "units")))
+  cat("\n")
+  
+  cat("End")
+  cat("\n")
+  
+  rm(list=setdiff(ls(),c("FileID","ImmcantationFolder","res_folder","Metadata_QC","t1")))
+  gc()
+  
+}
+  t2<-Sys.time()
+  cat(paste(">>> Pipeline complete for all samples:",t2))
+  cat("\n")
+  DiffGlobal<-t2-t1
+  cat(">>> Total runtime:",paste(round(as.numeric(DiffGlobal),2), attr(DiffGlobal, "units")))
+  cat("\n")
+  cat("\n")
+  
+sink()
+
+
+# Save the Metadata in RDS to generate plot later
+saveRDS(object = Metadata_QC,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","Metadata_Step4_IGHclones_All_105samples.rds"))
+```
+
+
+## Generate merged clonotype database
+
+### All light and heavy chains clonotypes
+
+```{r,eval=FALSE}
+airr_imm_db<-list()
+# Load all the final repertoire for all samples
+for(file in FileID){
+  tmp<-read_rearrangement(paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_Collapse-unique_at-least2-count.tsv"))
+  tmp$sample_id <-file
+  
+  #Frequency in all repertoire (IGK+IGL+IGH)
+  tmp$frequency_all_chain <-tmp$umi_count/sum(tmp$umi_count)
+    
+  # Frequency per chain 
+  tmp <- split(tmp,tmp$locus)
+  tmp<- lapply(tmp,function(sub){
+    sub$frequency_per_locus <- sub$umi_count/sum(sub$umi_count)
+    sub
+  })
+  tmp <- Reduce(rbind,tmp)
+  #store in list
+  airr_imm_db[[file]] <- tmp
+}
+airr_imm_db <- Reduce(rbind,airr_imm_db)
+rm(tmp)
+gc()
+
+qsave(x = airr_imm_db,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20250714_Immcantation_clonotypes_merged_AllSamples.qs"))
+
+## Renamed after anonymization of sample_id: 
+# saveRDS(object = airr_imm_db,file = paste0("PATH/","20260724_Immcantation_clonotypes_IGHKL_merged_AllSamples_anonymized.rds"))
+
+```
+
+### IGH with clone id identifier
+
+```{r,eval=F}
+Igh_imm_db<-list()
+# Load all the final repertoire for all samples
+for(file in FileID){
+  tmp<-read_rearrangement(paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/",file,"/",file,"_igblast-db_quality_filter-allFilter_germ-pass_chimeric-filter_Collapse-unique_at-least2-count_IGH-dist_clone-pass_germ-pass.tsv"))
+  tmp$sample_id <-file
+  
+  #store in list
+  Igh_imm_db[[file]] <- tmp
+}
+Igh_imm_db <- Reduce(rbind,Igh_imm_db)
+rm(tmp)
+gc()
+
+qsave(x = Igh_imm_db,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20250714_Immcantation_IGH_clonal_grouped_merged_AllSamples.qs"))
+
+## Renamed after anonymization of sample_id: 
+# saveRDS(object = Igh_imm_db,file = paste0("PATH/","20260724_Immcantation_IGH_clonal_grouped_merged_AllSamples_anonymized.rds"))
+
+```
+
+
+## Clonal diversity and frequency - Hill numbers
+
+### All IGH clones
+
+Compute Hill diversity according to clone frequency unweighted (num of sequence per clone) or weighted by umi_count (sum of umi_count of all sequences in a clone). As it was done for clone frequency, compute both from uniformly ressampled (all samples with same size : minimum size) or not uniformly ressampled (all sample with their original size). 
+
+NB : min_n increased to 1000 because it is recommended by the author to avoid artifacts in diversity calculations https://bitbucket.org/kleinstein/alakazam/issues/100/clonal-diversity 
+Also to avoid a too hard downsampling of all samples
+
+NB : At the end, I choosed the following parameters : unweighted (less biased by PC high counts) and uniformly resampled (uniform=T >> to correct the different sample sizes).
+
+```{r,eval=F}
+# Only 1 time to compute - then reload
+# Create a sub annotated with all sample related metadata and filter only ICI
+Igh_imm_db_ICIunique<-Igh_imm_db # NB here it correspond to the same table in input (metadata column are not necessary for clonal statistics analyis )
+
+###########################################################################
+###########################################################################
+#### Edit alpha diversity according to copy/min_n/uniform?
+###########################################################################
+###########################################################################
+var_to_iterate <- list(Unweighted_UniformlyResampled=list(min_n=1000,
+                         uniform=T,
+                         copy=c(NULL)),
+                       Unweighted_OriginalSize=list(min_n=1000,
+                         uniform=F, # not uniform
+                         copy=c(NULL)),
+                       umi_weighted_UniformlyResampled=list(min_n=6000,
+                         uniform=T,
+                         copy="umi_count"),
+                       umi_weighted_OriginalSize=list(min_n=6000,
+                         uniform=F, # not uniform
+                         copy="umi_count"))
+
+
+abund <- lapply(var_to_iterate,function(var_list){
+  alakazam::estimateAbundance(Igh_imm_db_ICIunique, group="sample_id", nboot=100,
+                              min_n = var_list[["min_n"]],
+                              copy = var_list[["copy"]],
+                              uniform = var_list[["uniform"]])
+})
+
+# NB : Warning message:
+# In alakazam::estimateAbundance(Igh_imm_db_ICIunique, group = "sample_id",  :
+#   Not all groups passed threshold min_n=1000. Excluded: PT_ZCG7VN_Tumor, PT_KQ9X6Y_Tumor
+
+
+### Note : many clone imputed by alakazam to estimate and correct sampling bias : identified as "U..."
+
+var_to_iterate<-setNames(names(var_to_iterate),nm = names(var_to_iterate)) # modify the vector to iterate on
+div <- lapply(var_to_iterate,function(var_list){
+  alakazam::alphaDiversity(abund[[var_list]], step_q=1, max_q=10)
+})
+
+#### Save estimateAbundance and alphaDiversity objects from Alakazam as qs to reload later if necessary
+qsave(x = abund,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20250812_Immcantation_IGH_clonal_alakazamEstimateAbundance_list.qs"))
+qsave(x = div,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20250812_Immcantation_IGH_clonal_alakazamAlphaDiversity_list.qs"))
+
+#renamed after anonymization + SELECT only Unweighted+Uniform=T in parameter & abundance/diversity table in anonymization process (only table used at the end in the published figures)
+# div <- div$Unweighted_UniformlyResampled
+# abund_list <- abund_list$Unweighted_UniformlyResampled
+# abund_list <- abund_list@abundance
+# div <- div@diversity 
+### renamed as follow :
+# saveRDS(object = abund_list,file = paste0("PATH/","20260724_Immcantation_IGH_clonal_alakazamEstimateAbundance_Unweighted_Uniform_anonymized.rds"))
+# 
+# saveRDS(object = div,file = paste0("PATH/","20260724_Immcantation_IGH_clonal_alakazamAlphaDiversity_Unweighted_Uniform_anonymized.rds"))
+
+```
+
+### Only class switched IGH clones (remove IgM/IgD)
+
+Perform again the comparaison but only for class switched isotypes - ie remove IgM and IgD clonotypes - to perform a more "fair" comparison of Tumor and Blood samples (hence blood samples are mainly composed of unswitched isotypes which is not the case for tumor samples that are mainly switched).
+
+First filter IGHM/IGHD (and IGH_NA) clonotypes, filters also the samples previously filtered in the global analysis due to too low count of Ig clonotypes. Then compute abundance and diversity with different parameters (unweighted / umi_weighted ; downsampled or original size) + different filters bases on a minimum number of clone/sequences (min_n filter) : no_filter; filter on 1000 or 6000 clones/sequences.
+Finally : choose Unweighted, Uniform=T (downsampled) & filter on 1000 sequences minimum.
+
+```{r,eval=FALSE}
+
+Igh_imm_db_ICIunique<-Igh_imm_db # NB here it correspond to the same table in input (metadata column are not necessary for clonal statistics analyis )
+
+
+###########################################################################
+###########################################################################
+#### Edit alpha diversity according to copy/min_n/uniform?
+###########################################################################
+###########################################################################
+var_to_iterate <- list(Unweighted_UniformlyResampled=list(min_n=1000,
+                         uniform=T,
+                         copy=c(NULL)),
+                       Unweighted_OriginalSize=list(min_n=1000,
+                         uniform=F, # not uniform
+                         copy=c(NULL)),
+                       umi_weighted_UniformlyResampled=list(min_n=6000,
+                         uniform=T,
+                         copy="umi_count"),
+                       umi_weighted_OriginalSize=list(min_n=6000,
+                         uniform=F, # not uniform
+                         copy="umi_count"))
+
+
+# Grouping by isotype & sample_id
+## first remove IGH_NA
+Igh_imm_db_ICIunique <- Igh_imm_db_ICIunique[Igh_imm_db_ICIunique$isotype != "IGH_NA",]
+## Remove also IgM and IgD
+Igh_imm_db_ICIunique <- Igh_imm_db_ICIunique[!(Igh_imm_db_ICIunique$isotype %in% c("IGHM","IGHD")),]
+
+## remove the samples filtered in previous analysis according to the min_n threshold >> try to Remove the min_n threshold here to compute diversity per isotypes irrespective of its original counts ...
+Igh_imm_db_ICIunique <- Igh_imm_db_ICIunique[!(Igh_imm_db_ICIunique$sample_id %in% c("PT_ZCG7VN_Tumor", "PT_KQ9X6Y_Tumor")), ] ### NB : edited here by anonymiz id
+
+## compute abundance 
+### without min_n filter (downsample on the minimum number of clone/sequences ...)
+abund <- lapply(var_to_iterate,function(var_list){
+  alakazam::estimateAbundance(Igh_imm_db_ICIunique, 
+                              group="sample_id",
+                              nboot=100,
+                              min_n = 1, # no min_n filter
+                              # min_n = var_list[["min_n"]],
+                              copy = var_list[["copy"]],
+                              uniform = var_list[["uniform"]])
+})
+
+### With min_n filter on 1000 clones / sequences >>> THIS IS THE FINAL PARAMETER USED
+##### In alakazam::estimateAbundance(Igh_imm_db_ICIunique, group = "sample_id",  :
+  # Not all groups passed threshold min_n=1000. Excluded 5 in more than previous 2 : PT_BEL9H5_Tumor, PT_41SWDR_PBMC_T0, PT_41SWDR_PBMC_T6, PT_9NCS0V_PBMC_HD, PT_529R1P_PBMC_HD
+abund_min1000 <- lapply(var_to_iterate,function(var_list){
+  alakazam::estimateAbundance(Igh_imm_db_ICIunique, 
+                              group="sample_id",
+                              nboot=100,
+                              min_n = 1000, # no min_n filter
+                              # min_n = var_list[["min_n"]],
+                              copy = var_list[["copy"]],
+                              uniform = var_list[["uniform"]])
+})
+
+### finally same but with min_n filter on 6000 clones/sequences (a bit too hard for unweighted but maybe relevent for umi_weighted ...)
+# unweighted : In alakazam::estimateAbundance(Igh_imm_db_ICIunique, group = "sample_id",  :
+#   Not all groups passed threshold min_n=6000. Excluded: a lot sample excluded [... edited but parameter not used ...]
+# umi_weighted: In alakazam::estimateAbundance(Igh_imm_db_ICIunique, group = "sample_id",  :
+#   Not all groups passed threshold min_n=6000. Excluded: PT_41SWDR_PBMC_T0, PT_41SWDR_PBMC_T6, PT_9NCS0V_PBMC_HD, PT_529R1P_PBMC_HD
+abund_min6000 <- lapply(var_to_iterate,function(var_list){
+  alakazam::estimateAbundance(Igh_imm_db_ICIunique, 
+                              group="sample_id",
+                              nboot=100,
+                              min_n = 6000, # no min_n filter
+                              # min_n = var_list[["min_n"]],
+                              copy = var_list[["copy"]],
+                              uniform = var_list[["uniform"]])
+})
+
+var_to_iterate<-setNames(names(var_to_iterate),nm = names(var_to_iterate)) # modify the vector to iterate on
+
+# Hill Diversity
+### withtout min_n
+div <- lapply(var_to_iterate,function(var_list){
+  print(paste("start",var_list))
+  alakazam::alphaDiversity(abund[[var_list]], step_q=1, max_q=10)
+})
+
+### min_n 1000 >>> THIS IS THE FINAL PARAMETER USED
+div_min1000 <- lapply(var_to_iterate,function(var_list){
+  print(paste("start",var_list))
+  alakazam::alphaDiversity(abund_min1000[[var_list]], step_q=1, max_q=10)
+})
+
+### min_n 6000
+div_min6000 <- lapply(var_to_iterate,function(var_list){
+  print(paste("start",var_list))
+  alakazam::alphaDiversity(abund_min6000[[var_list]], step_q=1, max_q=10)
+})
+
+#### Save estimateAbundance and alphaDiversity objects from Alakazam as qs to reload later if necessary
+# no min_n
+qsave(x = abund,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260408_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamEstimateAbundance_no_minSeqFilter_list.qs"))
+qsave(x = div,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260408_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamAlphaDiversity_no_minSeqFilter_list.qs"))
+
+# min_n 1000 seq >>> THIS IS THE FINAL PARAMETER USED
+qsave(x = abund_min1000,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260408_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamEstimateAbundance_min1000seqFilter_list.qs"))
+qsave(x = div_min1000,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260408_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamAlphaDiversity_min1000seqFilter_list.qs"))
+
+
+# min_ 6000 seq
+qsave(x = abund_min6000,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260408_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamEstimateAbundance_min6000seqFilter_list.qs"))
+qsave(x = div_min6000,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260408_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamAlphaDiversity_min6000seqFilter_list.qs"))
+
+
+
+
+#renamed after anonymization + SELECT only Unweighted+Uniform=T + min_n=1000 in parameter & abundance/diversity table in anonymization process (only table used at the end in the published figures)
+# div <- div$Unweighted_UniformlyResampled
+# abund_list <- abund_list$Unweighted_UniformlyResampled
+# abund_list <- abund_list@abundance
+# div <- div@diversity 
+### renamed as follow :
+# saveRDS(object = abund_list,file = paste0("PATH/","20260724_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min1000seqFilter_anonymized.rds"))
+# 
+# saveRDS(object = div,file = paste0("PATH/","20260724_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min1000seqFilter_anonymized.rds"))
+
+```
+
+
+
+### Only IgGs or IgAs pures IGH clones
+
+Same but measuring diversity of all IgGs or all IgAs.
+
+Filter at 500 sequences instead of 1000 (to filter less samples because there are fewer sequences after removing all non IgG or all non IgA clones ...).
+
+
+```{r,eval=FALSE}
+Igh_imm_db_ICIunique<-Igh_imm_db # NB here it correspond to the same table in input (metadata column are not necessary for clonal statistics analyis )
+
+
+###########################################################################
+###########################################################################
+#### Edit alpha diversity according to copy/min_n/uniform?
+###########################################################################
+###########################################################################
+var_to_iterate <- list(Unweighted_UniformlyResampled=list(min_n=1000,
+                         uniform=T,
+                         copy=c(NULL)),
+                       Unweighted_OriginalSize=list(min_n=1000,
+                         uniform=F, # not uniform
+                         copy=c(NULL)),
+                       umi_weighted_UniformlyResampled=list(min_n=6000,
+                         uniform=T,
+                         copy="umi_count"),
+                       umi_weighted_OriginalSize=list(min_n=6000,
+                         uniform=F, # not uniform
+                         copy="umi_count"))
+
+
+# Grouping by isotype & sample_id
+## first remove IGH_NA
+Igh_imm_db_ICIunique <- Igh_imm_db_ICIunique[Igh_imm_db_ICIunique$isotype != "IGH_NA",]
+
+## remove the samples filtered in previous analysis according to the min_n threshold >> try to Remove the min_n threshold here to compute diversity per isotypes irrespective of its original counts ...
+Igh_imm_db_ICIunique <- Igh_imm_db_ICIunique[!(Igh_imm_db_ICIunique$sample_id %in% c("PT_ZCG7VN_Tumor", "PT_KQ9X6Y_Tumor")), ] ### NB : edited here by anonymiz id
+
+# Vector of isotypes to iterate
+iso_vect <- list(IgGs=c("IGHG1","IGHG2","IGHG3","IGHG4"),IgAs=c("IGHA1","IGHA2"))
+
+## compute abundance 
+### without min_n filter (downsample on the minimum number of clone/sequences ...)
+abund <- lapply(iso_vect,function(iso){
+  # subset correct isotypes
+  tmp<-Igh_imm_db_ICIunique[Igh_imm_db_ICIunique$isotype %in% iso,] # keep only IgG or IgA
+  #list of abundance
+  lapply(var_to_iterate,function(var_list){
+    alakazam::estimateAbundance(tmp, 
+                                group="sample_id",
+                                nboot=100,
+                                min_n = 1, # no min_n filter
+                                # min_n = var_list[["min_n"]],
+                                copy = var_list[["copy"]],
+                                uniform = var_list[["uniform"]])
+  })
+})
+
+
+### With min_n filter=1000 / too many samples filtered
+abund_min1000 <- lapply(iso_vect,function(iso){
+  # subset correct isotypes
+  tmp<-Igh_imm_db_ICIunique[Igh_imm_db_ICIunique$isotype %in% iso,] # keep only IgG or IgA
+  #list of abundance
+  lapply(var_to_iterate,function(var_list){
+    alakazam::estimateAbundance(tmp, 
+                                group="sample_id",
+                                nboot=100,
+                                min_n = 1000, # no min_n filter
+                                # min_n = var_list[["min_n"]],
+                                copy = var_list[["copy"]],
+                                uniform = var_list[["uniform"]])
+  })
+})
+
+### finally same but with min_n filter on 500 clones/sequences (a bit less hard)
+# Warning messages:
+# IgGs (unweighted + Uniform=T+min_n=500): In alakazam::estimateAbundance(tmp, group = "sample_id", nboot = 100,  :
+#   Not all groups passed threshold min_n=500. Excluded 5 in more than previous 2: PT_J401JQ_PBMC_T6, PT_41SWDR_PBMC_T0, PT_41SWDR_PBMC_T6, PT_9NCS0V_PBMC_HD, PT_529R1P_PBMC_HD
+
+# IgAs (unweighted + Uniform=T+min_n=500): In alakazam::estimateAbundance(tmp, group = "sample_id", nboot = 100,  :
+#   Not all groups passed threshold min_n=500. Excluded 11 in more than previous 2: PT_Y6XN2H_PBMC_T6, PT_BEL9H5_Tumor, PT_41SWDR_PBMC_T0, PT_41SWDR_PBMC_T6, PT_41SWDR_Tumor, PT_DTP8BV_PBMC_T6, PT_22QBL1_PBMC_T6, PT_22QBL1_Tumor, PT_LGG57X_Tumor, PT_9NCS0V_PBMC_HD, PT_529R1P_PBMC_HD
+
+
+abund_min500 <- lapply(iso_vect,function(iso){
+  # subset correct isotypes
+  tmp<-Igh_imm_db_ICIunique[Igh_imm_db_ICIunique$isotype %in% iso,] # keep only IgG or IgA
+  #list of abundance
+  lapply(var_to_iterate,function(var_list){
+    alakazam::estimateAbundance(tmp, 
+                                group="sample_id",
+                                nboot=100,
+                                min_n = 500, # no min_n filter
+                                # min_n = var_list[["min_n"]],
+                                copy = var_list[["copy"]],
+                                uniform = var_list[["uniform"]])
+  })
+})
+
+
+var_to_iterate<-setNames(names(var_to_iterate),nm = names(var_to_iterate)) # modify the vector to iterate on
+iso_vect <- setNames(names(iso_vect),nm = names(iso_vect)) # modify the vector to iterate on
+
+# Hill Diversity
+### withtout min_n
+div <- lapply(iso_vect,function(iso){
+  # keep only correct iso
+  abund_iso <- abund[[iso]]
+  # list var
+  lapply(var_to_iterate,function(var_list){
+    print(paste("start",var_list))
+    alakazam::alphaDiversity(abund_iso[[var_list]], step_q=1, max_q=10)
+  })
+})
+
+### min_n 1000
+div_min1000 <- lapply(iso_vect,function(iso){
+  # keep only correct iso
+  abund_iso <- abund_min1000[[iso]]
+  # list var
+  lapply(var_to_iterate,function(var_list){
+    print(paste("start",var_list))
+    alakazam::alphaDiversity(abund_iso[[var_list]], step_q=1, max_q=10)
+  })
+})
+
+### min_n 500
+div_min500 <- lapply(iso_vect,function(iso){
+  # keep only correct iso
+  abund_iso <- abund_min500[[iso]]
+  # list var
+  lapply(var_to_iterate,function(var_list){
+    print(paste("start",var_list))
+    alakazam::alphaDiversity(abund_iso[[var_list]], step_q=1, max_q=10)
+  })
+})
+
+#### Save estimateAbundance and alphaDiversity objects from Alakazam as qs to reload later if necessary
+# no min_n
+qsave(x = abund,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260420_Immcantation_IGH_IgGs_or_IgAs_clonal_alakazamEstimateAbundance_no_minSeqFilter_list.qs"))
+qsave(x = div,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260420_Immcantation_IGH_IgGs_or_IgAs_clonal_alakazamAlphaDiversity_no_minSeqFilter_list.qs"))
+
+# min_n 1000 seq
+qsave(x = abund_min1000,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260420_Immcantation_IGH_IgGs_or_IgAs_clonal_alakazamEstimateAbundance_min1000seqFilter_list.qs"))
+qsave(x = div_min1000,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260420_Immcantation_IGH_IgGs_or_IgAs_clonal_alakazamAlphaDiversity_min1000seqFilter_list.qs"))
+
+
+# min_ 500 seq >>>>> THIS ONE WAS SELECTED FOR ANALYSIS
+qsave(x = abund_min500,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260420_Immcantation_IGH_IgGs_or_IgAs_clonal_alakazamEstimateAbundance_min500seqFilter_list.qs"))
+qsave(x = div_min500,file = paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260420_Immcantation_IGH_IgGs_or_IgAs_clonal_alakazamAlphaDiversity_min500seqFilter_list.qs"))
+
+
+
+
+#renamed after anonymization + SELECT only Unweighted+Uniform=T + min_n=500 in parameter & abundance/diversity table in anonymization process (only table used at the end in the published figures)
+# div <- div$Unweighted_UniformlyResampled
+# abund_list <- abund_list$Unweighted_UniformlyResampled
+# abund_list <- abund_list@abundance
+# div <- div@diversity 
+
+### renamed as follow :
+#### For IgGs
+# saveRDS(object = abund_list,file = paste0("PATH/","20260724_Immcantation_IGH_IgGs_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+# 
+# saveRDS(object = div,file = paste0("PATH/","20260724_Immcantation_IGH_IgGs_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+
+#### For IgAs
+# saveRDS(object = abund_list,file = paste0("PATH/","20260724_Immcantation_IGH_IgAs_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+# 
+# saveRDS(object = div,file = paste0("PATH/","20260724_Immcantation_IGH_IgAs_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+
+```
+
+
+# Reload merged dataset
+
+Reload data
+
+```{r}
+# Metadata ANONYMIZED - NB : Response to ICI is not shared due to patient privacy requirement but can be asked to the study sponsor unpon reasonable request (see article for contact)
+Immcantation_meta_ICI_unique <-readRDS(paste0("PATH/","20260723_Immunoverse_Metadata_AnonymId_ICIresponse.rds")) # edit : study sponsor accepted to share the information
+
+
+### airr dataset of all clonotypes (light chain and heavy chains) with anonymized id - lot of  memory necessary 
+#### Not directly necessary to reproduce plot because count of clonotypes are in the metadata
+# airr_imm_db<-readRDS(paste0(res_folder,"20260724_Immcantation_clonotypes_IGHKL_merged_AllSamples_anonymized.rds"))
+
+#### airr dataset of all IGH clonotypes with clone_id identifier
+Igh_imm_db<-readRDS(paste0(res_folder,"20260724_Immcantation_IGH_clonal_grouped_merged_AllSamples_anonymized.rds"))
+
+# Create a sub annotated with all sample related metadata and filter only ICI
+Igh_imm_db_ICIunique<-merge(Igh_imm_db,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type" ,"sample_type2","R_NR")],by="sample_id")
+
+#reload clone abundance and diversity for all IGH clones
+abund_allIGH <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_clonal_alakazamEstimateAbundance_Unweighted_Uniform_anonymized.rds"))
+div_allIGH <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_clonal_alakazamAlphaDiversity_Unweighted_Uniform_anonymized.rds"))
+
+
+#reload clone abundance and diversity only for class-switched IGH clones
+abund_ClassSwitch <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min1000seqFilter_anonymized.rds"))
+div_ClassSwitch <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min1000seqFilter_anonymized.rds"))
+
+
+#reload clone abundance and diversity only for IgGs only IGH clones
+abund_IgGs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgGs_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+div_IgGs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgGs_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+
+
+#reload clone abundance and diversity only for IgAs only IGH clones
+abund_IgAs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgAs_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+div_IgAs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgAs_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+
+```
+
+
+
+# Figures
+
+## Figure 4A - Experimental scheme (biorender)
+
+**Figure 4A compressed > see paper ...** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure4A_to_render_compressed.pdf"),density = 300)
+plot(img)
+```
+
+
+## Figure 4B - Ig clonotypes in each sample type
+
+
+```{r}
+# Number of clonotype Sample_type in full cohort 
+
+## get clonotypes column
+Clonotypes_col <- grep("clonotypes",colnames(Immcantation_meta_ICI_unique),value = T)
+
+## melt to plot
+melt_df<-Immcantation_meta_ICI_unique[,c("sample_id","sample_type","sample_type2","R_NR",Clonotypes_col)]
+colnames(melt_df)<- gsub("IG_","",gsub("Final_clonotypes","IG",colnames(melt_df))) ### simplify variables names
+melt_df <- reshape::melt.data.frame(melt_df,id.vars =c("sample_id","sample_type","sample_type2","R_NR") )
+
+
+### With HD PBMC
+df<-melt_df[(melt_df$variable != "IGH_NA"),]
+df<-df[(df$variable != "IG"),] # remove also IG total
+df_n<-unique(df[,c("sample_id","sample_type","R_NR")])
+df_n<-table(df_n$R_NR,df_n$sample_type)
+
+##### compare sample_type2
+  p<-ggplot(df,aes(x=sample_type2,y=value))+
+    geom_violin(aes(fill=sample_type2),draw_quantiles = 0.5)+
+    scale_fill_manual(values = ColorPal$sample_type2)+
+    geom_jitter(size=0.7)+
+    facet_wrap(~variable,nrow = 2)+
+    scale_y_continuous(trans = "log1p", breaks = base_breaksLog1p(),labels = prettyNum)+
+    stat_compare_means(size=3,label = "p.format")+
+    theme_bw()+
+      theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+    labs(x=NULL,y=paste("Number of clonotypes"),
+         title = "IG clonotypes in Tumor and PBMC samples from ICI treated patients or healthy donors",
+         subtitle = "test : Kruskal-Wallis (>2 groups) or Wilcoxon-Mann-Whitney (2 groups)",
+          caption= paste(paste(rep(colnames(df_n),each=3),rownames(df_n),sep = "-"),as.numeric(df_n),sep = ":",collapse = "; ") )
+  
+   ## This is Main Figure 4B
+  
+        ggsave(plot = p,
+           filename = paste0(res_folder,"Figure4B_Immcantation_Number_clonotypes_all_chains_PBMC_Tumor_Compare_sampleTypes_noSplitResponse_V2ligns.pdf"),
+           width = 11,height = 6)
+  
+```
+
+
+**Figure 4B** 
+```{r,fig.height=7,fig.width=12}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure4B_Immcantation_Number_clonotypes_all_chains_PBMC_Tumor_Compare_sampleTypes_noSplitResponse_V2ligns.pdf"),density = 300)
+plot(img)
+```
+
+## Figure S9A - Ig clonotypes in each sample type vs reponse to ICI
+
+
+```{r}
+# Number of clonotype Sample_type in full cohort 
+
+## get clonotypes column
+Clonotypes_col <- grep("clonotypes",colnames(Immcantation_meta_ICI_unique),value = T)
+
+## melt to plot
+melt_df<-Immcantation_meta_ICI_unique[,c("sample_id","sample_type","sample_type2","R_NR",Clonotypes_col)]
+colnames(melt_df)<- gsub("IG_","",gsub("Final_clonotypes","IG",colnames(melt_df))) ### simplify variables names
+melt_df <- reshape::melt.data.frame(melt_df,id.vars =c("sample_id","sample_type","sample_type2","R_NR") )
+
+
+### With HD PBMC
+df<-melt_df[(melt_df$variable != "IGH_NA"),]
+df<-df[(df$variable != "IG"),] # remove also IG total
+df_n<-unique(df[,c("sample_id","sample_type","R_NR")])
+df_n<-table(df_n$R_NR,df_n$sample_type)
+p<-ggplot(df,aes(x=R_NR,y=value))+
+    geom_violin(aes(fill=R_NR),draw_quantiles = 0.5)+
+    scale_fill_manual(values = ColorPal$R_NR)+
+    geom_jitter(size=0.7)+
+    facet_grid(sample_type~variable,scales="free")+
+    scale_y_continuous(trans = "log1p", breaks = base_breaksLog1p(),labels = prettyNum)+
+    stat_compare_means(size=3,label = "p.format")+
+    theme_bw()+
+    labs(x=NULL,y=paste("Number of clonotypes"),
+         title = "IG clonotypes in Tumor and PBMC samples from ICI treated patients or healthy donors - Immcantation pipeline",
+         subtitle = "test : Kruskal-Wallis (>2 groups) or Wilcoxon-Mann-Whitney (2 groups)",
+         caption = paste(paste(rep(colnames(df_n),each=3),rownames(df_n),sep = "-"),as.numeric(df_n),sep = ":",collapse = "; ") )
+
+
+    ## This is Supplementary Figure S9A
+    ggsave(plot = p,
+           filename = paste0(res_folder,"S9A_Immcantation_Number_clonotypes_all_chains_PBMC_Tumor_R_vs_NR.pdf"),
+           width = 10,height = 8)
+
+
+```
+
+
+**Figure S9A** 
+```{r,fig.height=7,fig.width=12}
+img <- magick::image_read_pdf(paste0(res_folder,"S9A_Immcantation_Number_clonotypes_all_chains_PBMC_Tumor_R_vs_NR.pdf"),density = 300)
+plot(img)
+```
+
+
+
+## Figure 4C - Ig clones diversity in each sample type
+
+```{r}
+# Plot diversity R/NR or sample_type for all kind of parameters
+## NB : initially a loop on all parameters. Here only the unweighted and uniform=T parameter are selected
+# var_to_iterate<-setNames(names(div),nm = names(div)) # modify the vector to iterate on
+
+var<-"Unweighted_UniformlyResampled"
+# for(var in var_to_iterate){
+  hill_div <- div_allIGH # Diversity of all IGH clones with Unweighted and Uniform=T and min_n=1000 parameters
+
+  ## Merge back with metadata info
+  hill_div<-merge(hill_div,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type","sample_type2","R_NR")],by="sample_id")
+ 
+  ## convert q in a factor rather than a numeric for plot
+  hill_div$q<-factor(hill_div$q)
+  
+
+  ##################
+  #####Tumor vs PBMC 
+  ################
+
+  ## Compute wilcox/kruskal test between Diversity~R_NR for each value of q
+  pval_df <- hill_div %>%
+    group_by(q) %>%
+    summarise(
+      n_groups = n_distinct(sample_type2),
+      p_value = if (n_groups < 2) {
+        NA_real_
+      } else if (n_groups == 2) {
+        tryCatch(wilcox.test(d ~ sample_type2)$p.value, error = function(e) NA_real_)
+      } else {
+        tryCatch(kruskal.test(d ~ sample_type2)$p.value, error = function(e) NA_real_)
+      },
+      .groups = "drop"
+    ) %>%
+    mutate(
+      p_label = case_when(
+        is.na(p_value) ~ "NA",
+        p_value < 0.001 ~ "***",
+        p_value < 0.01 ~ "**",
+        p_value < 0.05 ~ "*",
+        TRUE ~ "ns"
+      )
+    )
+  
+  ## add a y value to position the pvalue on plot on top +Inf
+  pval_df$d<-+Inf
+  
+  p<-ggplot(hill_div, aes(x = q, y = d ,color=sample_type2)) +
+    geom_line(aes(group = sample_id),alpha = 0.3) +
+    scale_color_manual(values = ColorPal$sample_type2)+
+    stat_summary(aes(group = sample_type2), fun = median, geom = "line", linewidth = 1.5) +
+    labs(title = "Alpha Diversity (Hill numbers) by Sample type", x = "q", y = "Diversity",
+         subtitle = paste("IGH clone frequency",var))+  
+    # facet_grid(.~R_NR,scales = "free_x",space = "free_x")+
+    geom_text(data = pval_df,aes(label = p_label),color = "black",size = 4,vjust=+1)+
+    # stat_compare_means(label = "p.format")+
+    theme_minimal()
+  
+  ##### THIS IS MAIN FIGURE 4C
+  
+  ggsave(plot = p,
+         filename = paste0(res_folder,"Figure4C_Immcantation_AlphaDiversity_",var,"_DiversityCurves_split_Response_compare_SampleType.pdf"),
+         height = 4,width = 6)
+
+#}
+
+```
+
+**Figure 4C** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure4C_Immcantation_AlphaDiversity_Unweighted_UniformlyResampled_DiversityCurves_split_Response_compare_SampleType.pdf"),density = 300)
+plot(img)
+```
+
+
+## Figure S9B - Ig clones diversity in each sample type vs reponse to ICI
+
+```{r}
+# Plot diversity R/NR or sample_type for all kind of parameters
+## NB : initially a loop on all parameters. Here only the unweighted and uniform=T parameter are selected
+# var_to_iterate<-setNames(names(div),nm = names(div)) # modify the vector to iterate on
+
+var<-"Unweighted_UniformlyResampled"
+# for(var in var_to_iterate){
+  hill_div <- div_allIGH # Diversity of all IGH clones with Unweighted and Uniform=T and min_n=1000 parameters
+
+  ## Merge back with metadata info
+  hill_div<-merge(hill_div,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type","sample_type2","R_NR")],by="sample_id")
+ 
+  ## convert q in a factor rather than a numeric for plot
+  hill_div$q<-factor(hill_div$q)
+  
+  ## Compute wilcox/kruskal test between Diversity~R_NR for each value of q
+  pval_df <- hill_div %>%
+    group_by(sample_type, q) %>%
+    summarise(
+      n_groups = n_distinct(R_NR),
+      p_value = if (n_groups < 2) {
+        NA_real_
+      } else if (n_groups == 2) {
+        tryCatch(wilcox.test(d ~ R_NR)$p.value, error = function(e) NA_real_)
+      } else {
+        tryCatch(kruskal.test(d ~ R_NR)$p.value, error = function(e) NA_real_)
+      },
+      .groups = "drop"
+    ) %>%
+    mutate(
+      p_label = case_when(
+        is.na(p_value) ~ "NA",
+        p_value < 0.001 ~ "***",
+        p_value < 0.01 ~ "**",
+        p_value < 0.05 ~ "*",
+        TRUE ~ "ns"
+      )
+    )
+  
+  ## add a y value to position the pvalue on plot on top +Inf
+  pval_df$d<-+Inf
+  
+  # diversity curve
+  ## R vs NR
+  p<-ggplot(hill_div, aes(x = q, y = d,color=R_NR)) +
+    geom_line(aes(group = sample_id),alpha = 0.3) +
+    scale_color_manual(values = ColorPal$R_NR)+
+    stat_summary(aes(group = R_NR), fun = median, geom = "line", linewidth = 1.5) +
+    labs(title = "Alpha Diversity (Hill numbers) by Response Group", x = "q", y = "Diversity",
+         subtitle = paste("IGH clone frequency",var))+  
+    facet_grid(.~sample_type,scales = "free_x",space = "free_x")+
+    geom_text(data = pval_df,aes(label = p_label),color = "black",size = 4,vjust=+1)+
+    theme_minimal() 
+    
+  
+  #### THIS IS SUPPLEMENTARY FIGURE S9B
+  
+  ggsave(plot = p,
+         filename = paste0(res_folder,"S9B_Immcantation_AlphaDiversity_",var,"_DiversityCurves_split_SampleType_compare_Response.pdf"),
+         height = 4,width = 8)
+  
+
+#}
+```
+
+**Figure S9B** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S9B_Immcantation_AlphaDiversity_Unweighted_UniformlyResampled_DiversityCurves_split_SampleType_compare_Response.pdf"),density = 300)
+plot(img)
+```
+
+## Figure 4D, 4E, 4F, & S9C - Ig clones frequency in each sample type
+
+
+```{r}
+# Plot diversity R/NR or sample_type for all kind of parameters
+## NB : Here only the unweighted and uniform=T parameter are selected
+
+var<-"Unweighted_UniformlyResampled"
+
+# Get correct abundance table
+clone_frequency <- abund_allIGH # abundance of all IGH clones with Unweighted and Uniform=T and min_n=1000 parameters
+
+## Merge back with metadata info
+clone_frequency<-merge(clone_frequency,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type","sample_type2","R_NR")],by="sample_id")
+
+
+###########################################################################
+# Clonal space (bining)
+###########################################################################
+## NB : sums the fre- quencies in each bin
+### binning the clone frequencies into the bins [0.0, 0.001], [0.001, 0.01], [0.01, 0.1], and [0.1, 1]
+###  Binning by rank is an alternative where the bins [1, 10], [11, 100], [101, 1000], and [1001, inf]
+
+### binning the clone frequencies
+bin_frequency <- clone_frequency
+bin_frequency<-tapply(bin_frequency$p,bin_frequency$sample_id,function(freq_sample){
+    bin_0_0001<-sum(freq_sample[freq_sample<=0.001])
+    bin_0001_001<-sum(freq_sample[freq_sample>0.001 & freq_sample<=0.01])
+    bin_001_01<-sum(freq_sample[freq_sample>0.01 & freq_sample<=0.1])
+    bin_01_1<-sum(freq_sample[freq_sample>0.1])
+    mat<-as.matrix(c("0.0, 0.001"=bin_0_0001,
+             "0.001, 0.01"=bin_0001_001,
+             "0.01, 0.1"=bin_001_01,
+             "0.1, 1"=bin_01_1))
+    colnames(mat)<-"frequency"
+    # mat<-data.frame(mat)
+    return(mat)
+})
+
+bin_frequency<-lapply(names(bin_frequency),function(nam){
+  mat<-bin_frequency[[nam]]
+  colnames(mat)<-nam
+  mat
+})
+
+bin_frequency<-Reduce(cbind,bin_frequency)
+bin_frequency<-as.data.frame(bin_frequency)
+
+bin_frequency$bin_frequency <-rownames(bin_frequency)
+bin_frequency$bin_frequency <- factor(bin_frequency$bin_frequency)
+
+bin_frequency<-reshape::melt.data.frame(bin_frequency,id.vars = "bin_frequency")
+
+## re merge with metadata
+bin_frequency$sample_id<-bin_frequency$variable
+bin_frequency<-merge(bin_frequency,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type","sample_type2","R_NR")],by="sample_id")
+
+## Order by R_NR - Stacked barplot
+sort_id <-unique(as.character(bin_frequency$sample_id)[order(bin_frequency$sample_type2,bin_frequency$R_NR,bin_frequency$sample_id)])
+bin_frequency$sample_id <- factor(as.character(bin_frequency$sample_id),
+                                  levels =sort_id )
+
+## create an anonym sample_id with Response type and then n° of patient (random ... just to simplify plot)
+bin_frequency$patient_id2 <- paste0("P",as.numeric(factor(bin_frequency$patient_id))) # numero of patient
+bin_frequency$sample_id2 <- paste(bin_frequency$R_NR,bin_frequency$patient_id2,sep = "_")
+
+p<-ggplot(bin_frequency,aes(x =sample_id2,y= value))+
+  geom_col(mapping = aes(fill=bin_frequency),color="black",position = "stack") +  # <- stack barplot
+  # geom_text(data = bin_frequency_label,mapping = aes(label=R_NR),size=3,angle=90,hjust=-0.2)+
+  facet_wrap(~sample_type2,scales = "free_x",drop = T,nrow = 2)+
+  theme_minimal()+
+  # scale_fill_manual(values = RColorBrewer::brewer.pal(length(levels(bin_frequency$bin_frequency)),"Spectral"))+
+    # scale_fill_manual(values = rev(RColorBrewer::brewer.pal(length(levels(bin_frequency$bin_frequency)),"Spectral")))+
+  scale_fill_viridis(option = "C",discrete = T)+
+  # theme(axis.text.x = element_blank())+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1,size=6))+
+  # scale_x_discrete(labels = bin_frequency$sample_id2)
+  labs(y="Clone frequency",title = "Bin clone frequency",x=NULL,fill="clone frequency",
+       subtitle = "Unweighted & uniformly resampled to min_n=1000")
+
+###### THIS IS MAIN FIGURE 4D (NB: order of barplot not exactly the same after anonymization of sample ... not really important actually ... this is the same information)
+ggsave(plot = p,
+       filename = paste0(res_folder,"Figure4D_Immcantation_ClonalFrequency_Unweighted_UniformlyResampled_BinFrequency_BarplotStacked.pdf"),
+       height = 5,width = 7)
+
+### Statistical comparisons : boxplot
+#### Tumor vs PBMC T0 vs PBMC T6
+p<-ggplot(bin_frequency,aes(x =bin_frequency,y= value,fill=sample_type2))+
+  geom_boxplot(outlier.size = 0.5,outlier.colour = "grey")+
+  geom_point(size=0.5,position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75))+
+  scale_fill_manual(values = ColorPal$sample_type2)+
+  # scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+  # facet_grid(.~R_NR,scales = "free_x",space = "free_x")+
+  stat_compare_means(label = "p.format")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+  # theme(legend.position = "none")+
+  labs(y="Clone frequency",title = "Bin clone frequency",x="Clone frequency categories",
+       subtitle = "Unweighted & uniformly resampled to min_n=1000")
+
+###### THIS IS MAIN FIGURE 4E
+
+ggsave(plot = p,
+       filename = paste0(res_folder,"Figure4E_Immcantation_ClonalFrequency_Unweighted_UniformlyResampled_BinFrequency_compare_SampleType.pdf"),
+       height = 4,width = 6)
+
+#### R vs NR
+p<-ggplot(bin_frequency,aes(x =bin_frequency,y= value,fill=R_NR))+
+  geom_boxplot(outlier.size = 0.5,outlier.colour = "grey")+
+  geom_point(size=0.5,position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75))+
+  scale_fill_manual(values = ColorPal$R_NR)+
+  # scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+  facet_grid(.~sample_type,scales = "free_x",space = "free_x")+
+  stat_compare_means(label = "p.signif")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+  # theme(legend.position = "none")+
+  labs(y="Clone frequency",title = "Bin clone frequency",x="Clone frequency categories",
+       subtitle = "Unweighted & uniformly resampled to min_n=1000")
+
+###### THIS IS SUPPLEMENTARY FIGURE 9C
+
+ggsave(plot = p,
+       filename = paste0(res_folder,"S9C_Immcantation_ClonalFrequency_Unweighted_UniformlyResampled_BinFrequency_split_SampleType_compare_Response.pdf"),
+       height = 4,width = 5)
+
+###########################################################################
+# Top clones
+###########################################################################
+## top 10
+clone_frequency_top10<-clone_frequency
+clone_frequency_top10$rank_character<-as.character(clone_frequency_top10$rank)
+clone_frequency_top10 <- clone_frequency_top10[clone_frequency_top10$rank_character %in% as.character(1:10),]#filter top 10
+clone_frequency_top10$rank_character <- factor(clone_frequency_top10$rank_character,levels = as.character(1:10)) # as factor
+
+### Tumor vs PBMC
+p<-ggplot(clone_frequency_top10,aes(x =rank_character,y= p,fill=sample_type2))+
+  geom_boxplot(outlier.size = 0.5,outlier.colour = "grey")+
+  geom_point(size=0.4,position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75),color="darkgrey")+
+  scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+  scale_fill_manual(values = ColorPal$sample_type2)+
+  # facet_grid(.~R_NR,scales = "free_x",space = "free_x")+
+  stat_compare_means(label = "p.signif")+
+  theme_minimal()+
+  # theme(legend.position = "none")+
+  labs(y="Clone frequency",title = "Rank clone abundance - Top 10 clones",
+       x="rank top10 clones",
+       subtitle = "Unweighted & uniformly resampled to min_n=1000")
+
+###### THIS IS MAIN FIGURE 4F
+
+ggsave(plot = p,
+       filename = paste0(res_folder,"Figure4F_Immcantation_ClonalFrequency_Unweighted_UniformlyResampled_Top10clone_split_Response_compare_SampleType.pdf"),
+       height = 4,width = 6)
+
+```
+
+
+**Figure 4D** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure4D_Immcantation_ClonalFrequency_Unweighted_UniformlyResampled_BinFrequency_BarplotStacked.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure 4E** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure4E_Immcantation_ClonalFrequency_Unweighted_UniformlyResampled_BinFrequency_compare_SampleType.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure 4F** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure4F_Immcantation_ClonalFrequency_Unweighted_UniformlyResampled_Top10clone_split_Response_compare_SampleType.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure S9C** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S9C_Immcantation_ClonalFrequency_Unweighted_UniformlyResampled_BinFrequency_split_SampleType_compare_Response.pdf"),density = 300)
+plot(img)
+```
+
+
+## Figure S9D - Ig clones diversity fold change pre-ICI to post-ICI in each sample type vs reponse to ICI
+
+
+
+```{r}
+# Plot diversity R/NR or sample_type for all kind of parameters
+## NB : initially a loop on all parameters. Here only the unweighted and uniform=T parameter are selected
+
+# Reload diversity list
+div<-div_allIGH# Diversity of all IGH clones with Unweighted and Uniform=T and min_n=1000 parameters
+
+# metadata at patient level
+Immcantation_meta_ICI_unique_patient<-unique(Immcantation_meta_ICI_unique[,c("patient_id","R_NR")])
+rownames(Immcantation_meta_ICI_unique_patient)<-Immcantation_meta_ICI_unique_patient$patient_id
+
+# Reformat as patients_id data.frame (wider)
+# div_patient<-lapply(div,function(sub_div){ # initially a list with 4 parameters. Here only 1
+
+  # get diversity value
+  # alpha_df <- sub_div@diversity # if raw results from alakazam function. Here this table is already obtained (see anonymisation)
+  alpha_df <- div # only 1 table
+  
+  # get patient id and sample type for each sample
+  alpha_df$patient_id <-gsub("_Tumor.*","",gsub("_PBMC.*","",alpha_df$sample_id))
+  alpha_df$sample_type <-gsub(".*Tumor.*","Tumor",gsub(".*PBMC","PBMC",alpha_df$sample_id))
+  
+  # reshape wider by patient id
+  alpha_df_wide <- pivot_wider(alpha_df,names_from = "sample_type",values_from = "d",id_cols =c("patient_id","q") )
+
+  # compute T6/T0 and T6/Tumor fold change
+  alpha_df_wide$FC_T6_on_T0 <- alpha_df_wide$PBMC_T6/alpha_df_wide$PBMC_T0
+  alpha_df_wide$FC_T6_on_Tumor <- alpha_df_wide$PBMC_T6/alpha_df_wide$Tumor
+  
+  
+  ## Merge back with metadata info
+  alpha_df_wide<-merge(alpha_df_wide,Immcantation_meta_ICI_unique_patient,by="patient_id")
+
+  ## convert q in a factor rather than a numeric for plot
+  alpha_df_wide$q<-factor(alpha_df_wide$q)
+  
+  ## return patient level df
+  # alpha_df_wide
+# })
+
+# now plot for each parameters used for estimation of alpha diversity
+# var_to_iterate <- setNames(names(div_patient),names(div_patient))
+var<-"Unweighted_UniformlyResampled"
+
+# for(var in var_to_iterate){
+  # retrive the patients lvl sample
+  # hill_div <- div_patient[[var]] # if loop on 4 paramters
+  hill_div <- alpha_df_wide#here only 1 parameter
+  
+  # create a melted na.omit df for raw value of diversity (paired test) / for FC
+  hill_div_melt_raw <- reshape::melt.data.frame(hill_div[,setdiff(colnames(hill_div),c("FC_T6_on_T0", "FC_T6_on_Tumor"))],id.vars =c("patient_id" ,"q", "R_NR") )
+  hill_div_melt_raw <- na.omit(hill_div_melt_raw)
+  hill_div_melt_raw$variable<-factor(as.character(hill_div_melt_raw$variable),
+                                 levels = c("Tumor","PBMC_T0", "PBMC_T6" , "PBMC_HD"))
+  
+  # FC
+  hill_div_melt_FC <- reshape::melt.data.frame(hill_div[,setdiff(colnames(hill_div),c("Tumor","PBMC_T0", "PBMC_T6" , "PBMC_HD"))],id.vars =c("patient_id" ,"q", "R_NR") )
+  hill_div_melt_FC <- na.omit(hill_div_melt_FC)
+  hill_div_melt_FC$variable<-factor(as.character(hill_div_melt_FC$variable),
+                                 levels = c("FC_T6_on_Tumor","FC_T6_on_T0"))
+  
+  ############################################################################
+  ########## First : Plot FC and re-use previous script
+  ############################################################################
+  
+  # diversity curve
+  ## R vs NR
+  ###log scale
+  p<-ggplot(hill_div_melt_FC, aes(x = q, y = value, group = patient_id,color=R_NR)) +
+    geom_line(alpha = 0.3) +
+    geom_hline(yintercept = 1,color="black",linetype="dashed")+
+    scale_color_manual(values = ColorPal$R_NR)+
+    scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+    # stat_summary(aes(group = R_NR), fun = median,geom = "line", linewidth = 1.5) +
+    stat_summary(aes(group = R_NR),
+                 fun = function(x) log10(median(10 ^ x)), # ADJUST IF LOG SCALE : order of mean/log
+                 geom = "line", linewidth = 1.5) +
+    labs(title = "Alpha Diversity (Hill numbers) - Fold change after treatment per patient", x = "q", y = "Diversity fold change",
+         subtitle = paste("IGH clone frequency",var))+  
+    facet_wrap(~variable,scales = "free")+
+    theme_minimal()
+  
+  ##### THIS IS Sup S9D (FC T6 on T0 correspond to S9D. left part)
+  
+  ggsave(plot = p,
+         filename = paste0(res_folder,"S9D_Immcantation_AlphaDiversity_",var,"_FoldChange_DiversityCurves_compare_Response_logScale.pdf"),
+         height = 5,width = 10)
+
+
+    ######## T6 on T0 >>> THIS one is actually S9D (left)
+  p<-ggplot(hill_div_melt_FC[hill_div_melt_FC$variable=="FC_T6_on_T0",], aes(x = q, y = value, group = patient_id,color=R_NR)) +
+    geom_line(alpha = 0.3) +
+    geom_hline(yintercept = 1,color="black",linetype="dashed")+
+    scale_color_manual(values = ColorPal$R_NR)+
+    scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+    # stat_summary(aes(group = R_NR), fun = median,geom = "line", linewidth = 1.5) +
+    stat_summary(aes(group = R_NR),
+                 fun = function(x) log10(median(10 ^ x)), # ADJUST IF LOG SCALE : order of mean/log
+                 geom = "line", linewidth = 1.5) +
+    labs(title = "Alpha Diversity (Hill numbers) - FC", x = "q", y = "Diversity fold change",
+         subtitle = paste("IGH clone frequency",var))+  
+    facet_wrap(~variable,scales = "free")+
+    theme_minimal()
+  
+  ggsave(plot = p,
+         filename = paste0(res_folder,"S9D_Immcantation_AlphaDiversity_",var,"_FoldChange_DiversityCurves_compare_Response_logScale_T6onT0.pdf"),
+         height = 4,width = 5)
+
+  
+  
+  # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+  # boxplot at specific q
+  # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+  
+  # alpha_q0 <- filter(hill_div_melt_FC, q == 0)
+  
+  ## R vs NR
+  p<-ggplot(hill_div_melt_FC, aes(x = R_NR, y = value,fill=R_NR)) +
+    geom_hline(yintercept = 1,color="black",linetype="dashed")+
+    geom_boxplot(outlier.size = 0.5,outlier.colour = "grey")+
+    scale_fill_manual(values = ColorPal$R_NR)+
+    geom_point(size=0.5,position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75))+
+    scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+    stat_compare_means(label = "p.format")+
+    labs(title = "Alpha Diversity (Hill numbers) - Fold change after treatment per patient", x = NULL, y = "Fold change",
+         subtitle = paste("IGH clone frequency",var))+  
+    # facet_grid(q~variable,scales = "free")+
+    facet_grid(variable~q,scales = "free")+
+    theme_minimal()
+  
+  ## This is S9D right 
+  
+  ggsave(plot = p,
+         filename = paste0(res_folder,"S9D_Immcantation_AlphaDiversity_",var,"_FoldChange_BoxplotWithStat_AllQvalue_compare_Response.pdf"),
+         height = 8,width = 10)
+  
+  
+  ##### Save also individual plot rather than facet (in log scale)
+  ######## T6 on T0 >>> This is actually S9D right
+  p<-ggplot(hill_div_melt_FC[hill_div_melt_FC$variable=="FC_T6_on_T0",], aes(x = R_NR, y = value,fill=R_NR)) +
+    geom_hline(yintercept = 1,color="black",linetype="dashed")+
+    geom_boxplot(outlier.size = 0.5,outlier.colour = "grey")+
+    scale_fill_manual(values = ColorPal$R_NR)+
+    geom_point(size=0.5,position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75))+
+    scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+    stat_compare_means(label = "p.format")+
+    labs(title = "Alpha Diversity (Hill numbers) - Fold change after treatment per patient", x = NULL, y = "Fold change",
+         subtitle = paste("IGH clone frequency",var))+  
+    # facet_grid(q~variable,scales = "free")+
+    facet_grid(variable~q,scales = "free")+
+    theme_minimal()
+  
+  ggsave(plot = p,
+         filename = paste0(res_folder,"S9D_Immcantation_AlphaDiversity_",var,"_FoldChange_BoxplotWithStat_AllQvalue_compare_Response_T6onT0.pdf"),
+         height = 4,width = 9)
+  
+  
+  ############################################################################
+  ############################################################################
+  ############################################################################
+  ########## Plot FC but add stat comparison of AUC per patients 
+  ############################################################################
+  ############################################################################
+  ############################################################################
+
+  # get back a q value in continuous data to compute AUC (rather than factor for plot)
+  hill_div_melt_FC$q<-as.numeric(as.character(hill_div_melt_FC$q))
+  
+  # compute AUC with MESS package on all q value ...
+  auc_data <- hill_div_melt_FC %>%
+      group_by(patient_id,variable, R_NR) %>%
+      summarise(AUC = auc(q, value))
+  
+  ###Evaluate normality of distribution  Shapiro–Wilk test
+  # Perform Shapiro-Wilk test for each treatment group
+  shapiro_results <- auc_data %>%
+    group_by(variable, R_NR) %>%
+    summarise(p_value = shapiro.test(AUC)$p.value)
+  normality_pass <- all(shapiro_results$p_value > 0.05)
+
+  # wilcoxon test
+  #T6_on_T0
+  auc_test_T6_on_T0 <- as.data.frame(auc_data)
+  auc_test_T6_on_T0<-auc_test_T6_on_T0[auc_test_T6_on_T0$variable %in% "FC_T6_on_T0",]
+  auc_test_T6_on_T0<-wilcox.test(AUC ~ R_NR, data = auc_test_T6_on_T0) #Test
+  auc_test_T6_on_T0<-paste("wilcox.test on AUC\np-value =", format(auc_test_T6_on_T0$p.value, digits = 2, scientific = F))
+  ##T6_on_Tumor
+  auc_test_T6_on_Tumor <- as.data.frame(auc_data)
+  auc_test_T6_on_Tumor<-auc_test_T6_on_Tumor[auc_test_T6_on_Tumor$variable %in% "FC_T6_on_Tumor",]
+  auc_test_T6_on_Tumor<-wilcox.test(AUC ~ R_NR, data = auc_test_T6_on_Tumor) #Test
+  auc_test_T6_on_Tumor<-paste("wilcox.test on AUC\np-value =", format(auc_test_T6_on_Tumor$p.value, digits = 2, scientific = F))
+  
+  ### create a dummy df to plot p_value
+  pval_df <-hill_div_melt_FC %>%
+    group_by(variable) %>%
+    summarise(value = max(value)+1) # get max per variable to plot in top
+  pval_df$q <- 8 # plot around q value of 8
+  pval_df$label<-ifelse(pval_df$variable=="FC_T6_on_Tumor",
+                        yes = auc_test_T6_on_Tumor,
+                        no=auc_test_T6_on_T0)
+  
+  ###log scale
+  p<-ggplot(hill_div_melt_FC, aes(x = q, y = value)) +
+    geom_line(aes(group = patient_id,color=R_NR),alpha = 0.3) +
+    # geom_hline(yintercept = 0,color="black",linetype="dashed")+
+    geom_hline(yintercept = 1,color="black",linetype="dashed")+
+    scale_color_manual(values = ColorPal$R_NR)+
+    scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum,expand = expansion(mult = 0.1))+
+    # scale_y_continuous(expand = expansion(mult = 0.1))+
+    # stat_summary(aes(group = R_NR,color=R_NR), fun = median,geom = "line", linewidth = 1.5) +
+    stat_summary(aes(group = R_NR,color=R_NR),
+                 fun = function(x) log10(median(10 ^ x)), # ADJUST IF LOG SCALE : order of mean/log
+                 geom = "line", linewidth = 1.5) +
+    geom_text(aes(label=label),data = pval_df)+
+    labs(title = "Alpha Diversity (Hill numbers) - Fold change after treatment per patient", x = "q", y = "Diversity Fold Change",
+         subtitle = paste("IGH clone frequency",var))+  
+    facet_wrap(~variable,scales = "free")+
+    theme_minimal()
+
+  
+  ### THIS IS THE FINAL S9D left With test on AUC
+  
+  ggsave(plot = p,
+         filename = paste0(res_folder,"S9D_Immcantation_AlphaDiversity_",var,"_FoldChange_DiversityCurves_compare_Response_logScale_WithAUC_wilcoxTest.pdf"),
+         height = 5,width = 10)
+  
+  ##### Save also individual plot rather than facet (in log scale)
+  ######## T6 on T0 >>> This one is the individual final plot ...
+  p<-ggplot(hill_div_melt_FC[hill_div_melt_FC$variable %in% "FC_T6_on_T0",], aes(x = q, y = value)) +
+    geom_line(aes(group = patient_id,color=R_NR),alpha = 0.3) +
+    # geom_hline(yintercept = 0,color="black",linetype="dashed")+
+    geom_hline(yintercept = 1,color="black",linetype="dashed")+
+    scale_color_manual(values = ColorPal$R_NR)+
+    scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum,expand = expansion(mult = 0.1))+
+    # scale_y_continuous(expand = expansion(mult = 0.1))+
+    # stat_summary(aes(group = R_NR,color=R_NR), fun = median,geom = "line", linewidth = 1.5) +
+    stat_summary(aes(group = R_NR,color=R_NR),
+                 fun = function(x) log10(median(10 ^ x)), # ADJUST IF LOG SCALE : order of mean/log
+                 geom = "line", linewidth = 1.5) +
+    geom_text(aes(label=label),data = pval_df[pval_df$variable %in% "FC_T6_on_T0",])+
+    labs(title = "Alpha Diversity (Hill numbers) - FC", x = "q", y = "Diversity Fold Change",
+         subtitle = paste("IGH clone frequency",var))+  
+    facet_wrap(~variable,scales = "free")+
+    theme_minimal()
+  
+  ggsave(plot = p,
+         filename = paste0(res_folder,"S9D_Immcantation_AlphaDiversity_",var,"_FoldChange_BoxplotWithStat_AllQvalue_compare_Response_T6onT0_WithAUC_wilcoxTest.pdf"),
+         height = 4,width = 5)
+  
+#}
+
+  
+```
+
+**Figure S9D (left : with AUC test)** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S9D_Immcantation_AlphaDiversity_Unweighted_UniformlyResampled_FoldChange_BoxplotWithStat_AllQvalue_compare_Response_T6onT0_WithAUC_wilcoxTest.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure S9D (right)** 
+```{r,fig.height=7,fig.width=10}
+img <- magick::image_read_pdf(paste0(res_folder,"S9D_Immcantation_AlphaDiversity_Unweighted_UniformlyResampled_FoldChange_BoxplotWithStat_AllQvalue_compare_Response_T6onT0.pdf"),density = 300)
+plot(img)
+```
+
+
+## Figure S10A - Class-switched Ig clones diversity and frequency in each sample type 
+
+
+```{r}
+# Create a list of diversity object according to different min_n filter (list containing lists ...)
+## diversity
+  ## NB : initially a loop on all parameters. Here only the unweighted and uniform=T parameter are selected
+# div_list <- list(noFilter=div_noFilter,
+#                  min1000=div_min1000,
+#                  min6000=div_min6000)
+# 
+# 
+# ## abundance
+# abund_list <- list(noFilter=abund_noFilter,
+#                    min1000=abund_min1000,
+#                    min6000=abund_min6000)
+
+# Create to vector to iterate on
+## different min_n filter
+# minN_to_iterate<-setNames(names(div_list),nm = names(div_list)) 
+
+minN <- "min1000" # set this here
+
+## variables in each list : downsample or not / unweighted or umi_weighted
+# var_to_iterate<-setNames(names(div_list$noFilter),nm = names(div_list$noFilter)) 
+var <- "Unweighted_UniformlyResampled"
+
+# Iterate plot diversity R/NR or sample_type for all kind of parameters
+## NB : min6000 raised an error for the correlation analysis > to few samples > do not consider this filter which is too stringent .......
+
+# for(minN in minN_to_iterate){
+#   print(paste("start:",minN))
+#   
+#   for(var in var_to_iterate){
+#     print(paste("start:",var))
+    
+    # get correct diversity
+    # hill_div <- div_list[[minN]][[var]]@diversity
+    hill_div <- div_ClassSwitch # Diversity of class switched IGH clones with Unweighted and Uniform=T and min_n=1000 parameters
+  
+    ## Merge back with metadata info
+    hill_div<-merge(hill_div,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type","sample_type2","R_NR")],by="sample_id")
+    
+    ## convert q in a factor rather than a numeric for plot
+    hill_div$q<-factor(hill_div$q)
+    
+    ########    ########    ########    ########    ########
+    # I - GLOBAL diversity curve
+    ########    ########    ########    ########    ########
+    ## Ia- sample_type global 
+    
+    ### Compute number of sample in the corresponding filter/parameter
+    num_samples <- table(hill_div[hill_div$q =="0",c("sample_type2")])
+    num_samples<-data.frame(num_samples)
+    num_samples <- num_samples[num_samples$Freq !=0,] # remove lines without any samples
+    final_label <- paste(paste("Tumor:",paste(num_samples$Freq[num_samples$Var1 %in% "Tumor.T0"],collapse = ", ")),
+                         paste("PBMC.T0:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.T0"],collapse = ", ")),
+                         paste("PBMC.T6:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.T6"],collapse = ", ")),
+                         paste("PBMC.HD:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.HD"],collapse = ", ")),
+                         sep = " ; ")
+  
+    #### after removing PBMC HD
+    
+    ### diversity curve
+    p<-ggplot(hill_div[!grepl("HD",hill_div$sample_id),], aes(x = q, y = d,color=sample_type2)) + # reomve HD
+      geom_line(aes(group = sample_id),alpha = 0.3) +
+      stat_summary(aes(group = sample_type2), fun = median, geom = "line", linewidth = 1.5) +
+      scale_color_manual(values = ColorPal$sample_type2)+
+      stat_compare_means(label = "p.signif",size=3.5)+
+      # stat_compare_means(size=3.5)+
+      labs(title = "Diversity of class-switched IGH", x = "q", y = "Diversity (class-switched IGH)",
+           subtitle = gsub("...PBMC.HD:..","",final_label), # reomve HD
+           color="sample_type",
+           caption = paste(minN,"sequences, ",var))+  
+        theme_classic()
+    
+    # THIS IS SUP S10A left
+    ggsave(plot = p,
+           filename = paste0(res_folder,"S10A_Immcantation_AlphaDiversity_ClassSwitchedIGH_",minN,"_",var,"_DiversityCurves_Compare_SampleType_RemoveHD.pdf"),
+           height = 5,width = 7)
+    
+   
+    
+    ########    ########    ########    ########    ######## ################################
+    # Abundance of clones
+    ########    ########    ########    ########    ######## ################################
+
+    # Get correct clone_frequency according to variables in the loop
+    # clone_frequency <- abund_list[[minN]][[var]]@abundance
+    clone_frequency <- abund_ClassSwitch # Abundance of class switched IGH clones with Unweighted and Uniform=T and min_n=1000 parameters
+    
+    ## Merge back with metadata info
+    clone_frequency<-merge(clone_frequency,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type","sample_type2","R_NR")],by="sample_id")
+
+    ### Compute number of sample in the corresponding filter/parameter
+    clone_frequency$rank_character<-as.character(clone_frequency$rank)
+    
+    ###### number of samples split by R_NR group
+    num_samples <- table(clone_frequency[clone_frequency$rank_character =="1",c("R_NR","sample_type")])
+    num_samples<-data.frame(num_samples)
+    num_samples <- num_samples[num_samples$Freq !=0,] # remove lines without any samples
+    num_samples$label <- paste(num_samples$Freq,num_samples$R_NR,sep = "-") # paste n and R_NR group
+    final_label_R_NR <- paste(paste("Tumor:",paste(num_samples$label[num_samples$sample_type %in% "Tumor.T0"],collapse = ", ")),
+                         paste("PBMC.T0:",paste(num_samples$label[num_samples$sample_type %in% "PBMC.T0"],collapse = ", ")),
+                         paste("PBMC.T6:",paste(num_samples$label[num_samples$sample_type %in% "PBMC.T6"],collapse = ", ")),
+                         sep = " ; ")
+    
+    ###### number of samples overall (only by sample type)
+    num_samples <- table(clone_frequency[clone_frequency$rank_character =="1",c("sample_type2")])
+    num_samples<-data.frame(num_samples)
+    num_samples <- num_samples[num_samples$Freq !=0,] # remove lines without any samples
+    final_label_SampleType <- paste(paste("Tumor:",paste(num_samples$Freq[num_samples$Var1 %in% "Tumor.T0"],collapse = ", ")),
+                         paste("PBMC.T0:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.T0"],collapse = ", ")),
+                         paste("PBMC.T6:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.T6"],collapse = ", ")),
+                         paste("PBMC.HD:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.HD"],collapse = ", ")),
+                         sep = " ; ")
+      
+      
+    ###########################################################################
+    # Top clones
+    ###########################################################################
+    ## top 10
+    clone_frequency_top10<-clone_frequency
+    clone_frequency_top10$rank_character<-as.character(clone_frequency_top10$rank)
+    clone_frequency_top10 <- clone_frequency_top10[clone_frequency_top10$rank_character %in% as.character(1:10),]#filter top 10
+    clone_frequency_top10$rank_character <- factor(clone_frequency_top10$rank_character,levels = as.character(1:10)) # as factor
+    
+    ##  without HD PBMC
+    p<-ggplot(clone_frequency_top10[!grepl("HD",clone_frequency_top10$sample_id),],aes(x =rank_character,y= p,fill=sample_type2))+ # remove HD
+      geom_boxplot(outlier.size = 0.5,outlier.colour = "grey")+
+      geom_point(size=0.4,position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75),color="darkgrey")+
+      scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+      scale_fill_manual(values = ColorPal$sample_type2)+
+      # facet_grid(.~R_NR,scales = "free_x",space = "free_x")+
+      stat_compare_means(label = "p.signif")+
+      theme_classic()+
+      # theme(legend.position = "none")+
+      labs(y="Clone frequency of class-switched IGH",
+           title = "Rank clone abundance of class-switched IGH - Top 10 clones",
+           x="Rank of top 10 clones",
+           subtitle = gsub("...PBMC.HD...","",final_label_SampleType), # remove HD
+           fill="sample_type",
+           caption = paste(minN,"sequences, ",var))
+    
+    ### THIS IS SUP S10A right
+    ggsave(plot = p,
+           filename = paste0(res_folder,"S10A_Immcantation_AlphaDiversity_ClassSwitchedIGH_",minN,"_",var,"_Top10clone_compare_SampleType_RemoveHD.pdf"),
+           height = 4,width = 6)
+    
+#   }
+# }
+
+```
+
+**Figure S10A (left)** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S10A_Immcantation_AlphaDiversity_ClassSwitchedIGH_min1000_Unweighted_UniformlyResampled_DiversityCurves_Compare_SampleType_RemoveHD.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure S10A (right)** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S10A_Immcantation_AlphaDiversity_ClassSwitchedIGH_min1000_Unweighted_UniformlyResampled_Top10clone_compare_SampleType_RemoveHD.pdf"),density = 300)
+plot(img)
+```
+
+
+## Figure S10B & S10C - IgGs or IgAs pure clones diversity and frequency in each sample type 
+
+
+```{r}
+# Create a list of diversity object according to different min_n filter (list containing lists ...)
+## diversity
+  ## NB : initially a loop on all parameters. Here only the unweighted and uniform=T parameter are selected
+# 
+# div_list <- list(noFilter=div_noFilter,
+#                  min500=div_min500,
+#                  min1000=div_min1000
+#                  )
+# 
+# 
+# ## abundance
+# abund_list <- list(noFilter=abund_noFilter,
+#                    min500=abund_min500,
+#                    min1000=abund_min1000
+#                    )
+
+# Create to vector to iterate on
+## different min_n filter
+# minN_to_iterate<-setNames(names(div_list),nm = names(div_list)) 
+
+minN <- "min500" # parameter set. Initially loop to test multiple
+
+## Isotype factor
+
+div_list <- list(IgGs=div_IgGs,
+                 IgAs=div_IgAs) # set a list on isotype
+
+abund_list <- list(IgGs=abund_IgGs,
+                 IgAs=abund_IgAs) # same for abundance
+
+# iso_vect <- setNames(names(div_list$noFilter),nm = names(div_list$noFilter)) 
+iso_vect <- setNames(names(div_list),nm = names(div_list)) 
+
+## variables in each list : downsample or not / unweighted or umi_weighted
+# var_to_iterate<-setNames(names(div_list$noFilter$IgGs),nm = names(div_list$noFilter$IgGs)) 
+var <- "Unweighted_UniformlyResampled" # parameter set. Initially loop to test multiple
+
+# Iterate plot diversity R/NR or sample_type for all kind of parameters
+
+# for(minN in minN_to_iterate){
+#   print(paste("start:",minN))
+#   
+  for(iso in iso_vect){
+    # print(paste("start:",iso))
+    
+      # for(var in var_to_iterate){
+      # print(paste("start:",var))
+      # 
+      # get correct diversity
+      # hill_div <- div_list[[minN]][[iso]][[var]]@diversity ### Add isotype level of the list
+    
+       hill_div <- div_list[[iso]] # Diversity of IgGs or IgAs clones with Unweighted and Uniform=T and min_n=500 parameters
+  
+
+      ## Merge back with metadata info
+      hill_div<-merge(hill_div,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type","sample_type2","R_NR")],by="sample_id")
+      
+      ## convert q in a factor rather than a numeric for plot
+      hill_div$q<-factor(hill_div$q)
+      
+        
+      ########    ########    ########    ########    ########
+      # I - GLOBAL diversity curve
+      ########    ########    ########    ########    ########
+      ## Ia- sample_type global 
+      
+      ### Compute number of sample in the corresponding filter/parameter
+      num_samples <- table(hill_div[hill_div$q =="0",c("sample_type2")])
+      num_samples<-data.frame(num_samples)
+      num_samples <- num_samples[num_samples$Freq !=0,] # remove lines without any samples
+      final_label <- paste(paste("Tumor:",paste(num_samples$Freq[num_samples$Var1 %in% "Tumor.T0"],collapse = ", ")),
+                           paste("PBMC.T0:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.T0"],collapse = ", ")),
+                           paste("PBMC.T6:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.T6"],collapse = ", ")),
+                           paste("PBMC.HD:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.HD"],collapse = ", ")),
+                           sep = " ; ")
+     
+      ####  after removing PBMC HD
+      
+      ### diversity curve
+      p<-ggplot(hill_div[!grepl("HD",hill_div$sample_id),], aes(x = q, y = d,color=sample_type2)) + # reomve HD
+        geom_line(aes(group = sample_id),alpha = 0.3) +
+        stat_summary(aes(group = sample_type2), fun = median, geom = "line", linewidth = 1.5) +
+        scale_color_manual(values = ColorPal$sample_type2)+
+        stat_compare_means(label = "p.signif",size=3.5)+
+        # stat_compare_means(size=3.5)+
+        labs(title = paste("Diversity of",iso,"clones"), x = "q", y = paste("Diversity of",iso),
+             subtitle = gsub("...PBMC.HD:..","",final_label), # reomve HD
+             color="sample_type",
+             caption = paste(minN,"sequences, ",var))+  
+          theme_classic()
+      
+      ### This is SUP S10B or S10C left (depending on isotype)
+      prefixe <- ifelse(iso=="IgGs",yes = "S10B_",no = "S10C_")
+      ggsave(plot = p,
+             filename = paste0(res_folder,prefixe,"Immcantation_AlphaDiversity_All_",iso,"_",minN,"_",var,"_DiversityCurves_Compare_SampleType_RemoveHD.pdf"),
+             height = 5,width = 7)
+      
+      
+      ########    ########    ########    ########    ######## ################################
+      # Abundance of clones
+      ########    ########    ########    ########    ######## ################################
+  
+      # Get correct clone_frequency according to variables in the loop
+      # clone_frequency <- abund_list[[minN]][[iso]][[var]]@abundance ### Add the isotye level in list
+      clone_frequency <- abund_list[[iso]] # Abundance of IgGs or IgAs clones with Unweighted and Uniform=T and min_n=500 parameters
+      
+      ## Merge back with metadata info
+      clone_frequency<-merge(clone_frequency,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type","sample_type2","R_NR")],by="sample_id")
+  
+      ### Compute number of sample in the corresponding filter/parameter
+      clone_frequency$rank_character<-as.character(clone_frequency$rank)
+      
+      ###### number of samples split by R_NR group
+      num_samples <- table(clone_frequency[clone_frequency$rank_character =="1",c("R_NR","sample_type")])
+      num_samples<-data.frame(num_samples)
+      num_samples <- num_samples[num_samples$Freq !=0,] # remove lines without any samples
+      num_samples$label <- paste(num_samples$Freq,num_samples$R_NR,sep = "-") # paste n and R_NR group
+      final_label_R_NR <- paste(paste("Tumor:",paste(num_samples$label[num_samples$sample_type %in% "Tumor.T0"],collapse = ", ")),
+                           paste("PBMC.T0:",paste(num_samples$label[num_samples$sample_type %in% "PBMC.T0"],collapse = ", ")),
+                           paste("PBMC.T6:",paste(num_samples$label[num_samples$sample_type %in% "PBMC.T6"],collapse = ", ")),
+                           sep = " ; ")
+      
+      ###### number of samples overall (only by sample type)
+      num_samples <- table(clone_frequency[clone_frequency$rank_character =="1",c("sample_type2")])
+      num_samples<-data.frame(num_samples)
+      num_samples <- num_samples[num_samples$Freq !=0,] # remove lines without any samples
+      final_label_SampleType <- paste(paste("Tumor:",paste(num_samples$Freq[num_samples$Var1 %in% "Tumor.T0"],collapse = ", ")),
+                           paste("PBMC.T0:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.T0"],collapse = ", ")),
+                           paste("PBMC.T6:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.T6"],collapse = ", ")),
+                           paste("PBMC.HD:",paste(num_samples$Freq[num_samples$Var1 %in% "PBMC.HD"],collapse = ", ")),
+                           sep = " ; ")
+        
+        
+      ###########################################################################
+      # Top clones
+      ###########################################################################
+      ## top 10
+      clone_frequency_top10<-clone_frequency
+      clone_frequency_top10$rank_character<-as.character(clone_frequency_top10$rank)
+      clone_frequency_top10 <- clone_frequency_top10[clone_frequency_top10$rank_character %in% as.character(1:10),]#filter top 10
+      clone_frequency_top10$rank_character <- factor(clone_frequency_top10$rank_character,levels = as.character(1:10)) # as factor
+
+      ## without HD PBMC
+      p<-ggplot(clone_frequency_top10[!grepl("HD",clone_frequency_top10$sample_id),],aes(x =rank_character,y= p,fill=sample_type2))+ # remove HD
+        geom_boxplot(outlier.size = 0.5,outlier.colour = "grey")+
+        geom_point(size=0.4,position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75),color="darkgrey")+
+        scale_y_continuous(trans = "log10", breaks = base_breaksLog10(),labels = prettyNum)+
+        scale_fill_manual(values = ColorPal$sample_type2)+
+        # facet_grid(.~R_NR,scales = "free_x",space = "free_x")+
+        stat_compare_means(label = "p.signif")+
+        theme_classic()+
+        # theme(legend.position = "none")+
+        labs(y=paste("Clone frequency of",iso),
+             title = paste("Rank clone abundance of",iso," - Top 10 clones"),
+             x="Rank of top 10 clones",
+             subtitle = gsub("...PBMC.HD...","",final_label_SampleType), # remove HD
+             fill="sample_type",
+             caption = paste(minN,"sequences, ",var))
+      
+      ### This is SUP S10B or S10C right (depending on isotype)
+      prefixe <- ifelse(iso=="IgGs",yes = "S10B_",no = "S10C_")
+      ggsave(plot = p,
+             filename = paste0(res_folder,prefixe,"Immcantation_AlphaDiversity_All_",iso,"_",minN,"_",var,"_Top10clone_compare_SampleType_RemoveHD.pdf"),
+             height = 4,width = 6)
+      
+    # } # end variable loop
+    
+    
+  } # end Isotype loop
+
+# } # end min n loop
+
+```
+
+
+**Figure S10B (left)** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S10B_Immcantation_AlphaDiversity_All_IgGs_min500_Unweighted_UniformlyResampled_DiversityCurves_Compare_SampleType_RemoveHD.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure S10B (right)** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S10B_Immcantation_AlphaDiversity_All_IgGs_min500_Unweighted_UniformlyResampled_Top10clone_compare_SampleType_RemoveHD.pdf"),density = 300)
+plot(img)
+```
+
+
+
+**Figure S10C (left)** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S10C_Immcantation_AlphaDiversity_All_IgAs_min500_Unweighted_UniformlyResampled_DiversityCurves_Compare_SampleType_RemoveHD.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure S10C (right)** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S10C_Immcantation_AlphaDiversity_All_IgAs_min500_Unweighted_UniformlyResampled_Top10clone_compare_SampleType_RemoveHD.pdf"),density = 300)
+plot(img)
+```
+
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```

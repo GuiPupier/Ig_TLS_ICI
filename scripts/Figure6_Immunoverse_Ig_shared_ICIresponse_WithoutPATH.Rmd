@@ -1,0 +1,1611 @@
+---
+title: "Immunoverse Immcantation Clonal analysis - Ig shared and response to ICI"
+author: "Guilhem Pupier"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  rmdformats::readthedown:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+Paired **Tumor**, **PBMC before ICI treatment (T0)** and **after 6 weeks of ICI treatment (T6)**, stored frozen, were processed to extract RNA, generate Immunoverse libraries, and compare the total Ig repertoire between these samples and according to **ICI treatment response (R= responders, NR= non responders)**. A total of 90 paired samples from 30 patients (12NR + 18R) were analyzed together with an additional tumor from a NR patient lacking the paired blood samples, as well as 5 blood samples from **healthy donors (HD)** used as reference.
+
+
+Goal :
+
+- To analyze Ig shared between samples and between patients and association with response to ICI.  
+
+Sections :
+
+- **Preprocess** :  
+Most pre-process steps to identify clonotypes in Immuoverse data are availables in previous script "Figure4". Strategy to group clonotypes in clones between all samples from all patients as well as CompAIRR pre-processing are indicated in this section. NB: Pre-process steps of bulk RNA-seq derived repertoire data used to reproduce Figure S12 are indicated in the script "Figure1".       
+
+- **Reload merged dataset** :  
+Reload data to generate plots.
+
+- **Figures** : 
+Script to reproduce Figure 6, S12 and S13.  
+
+# Load required packages
+
+
+```{r,eval=T}
+library(airr)
+library(alakazam)
+library(shazam) # airr data packages
+
+library(data.table) # function fread() for efficient and fast read of tab file
+
+library(stringi)
+library(stringr) # string manipulations
+
+library(dplyr) 
+library(tidyr)
+library(reshape2) # table manipulations
+
+# library(MESS) # compute AUC
+
+library(pastecs)
+library(RColorBrewer)
+library(viridis) # color palettes
+library(patchwork)
+library(ggplot2)
+library(ggpubr)
+library(grid)
+library(gridExtra)
+library(scales) # plot functions
+#from Heather Turner @stackoverflow ## Adapt y scale in log scale 
+base_breaksLog10 <- function(n = 10){
+  function(x) {
+    axisTicks(log10(range(x, na.rm = TRUE)), log = T, n = n)
+  }
+}
+base_breaksLog1p <- function(n = 10){
+  function(x) {
+    axisTicks(log1p(range(x, na.rm = TRUE)), log = T, n = n)
+  }
+}
+
+# library(qs) # optimize (faster than rds) writing and reading of large dataset in R
+
+# plot contingency (fro Maxime Meylan)
+plot_contingency <- function(data,
+           variables = c("TLS_pos", "HBV"),
+           hide_legend = F,
+           text_size=6,
+           text_position_side=T,
+           create_labels = T,
+           inverse_factor2=F,
+           order_factor=NULL,
+           palette = NA,
+           geom_label=F,
+           test_name = c("chisq.test", "fisher.test")[1],
+           labs = c(xlab = "",
+                    ylab = "",
+                    legend_title = ""),
+           hide_test = F,
+           title = ""){
+    if(inverse_factor2){
+      data[,variables[2]] <- factor(data[,variables[2]],levels=rev(levels(data[,variables[2]])))
+    }
+    cont_table <- table(data[,variables[1]],data[,variables[2]])
+    #clean data table to avoid empty rows
+    non_empty_rows <- rowSums(cont_table)!=0
+    cont_table <- cont_table[non_empty_rows,]
+
+    if(create_labels){
+      #sapply(levels(factor(data[,variables[2]])), function(x) paste(variables[2],x,sep="_"))
+      colnames(cont_table) <- sapply(levels(factor(data[,variables[2]])), function(x) paste(variables[2],x,sep="_"))
+      rownames(cont_table) <- sapply(levels(factor(data[,variables[1]])), function(x) paste(variables[1],x,sep="_"))
+    }
+  if(test_name != "fisher.test" & test_name != "chisq.test"){
+    stop("incorrect test, valid options are fisher.test or chisq.test")
+  }
+  if(test_name == "fisher.test"){
+    error_test <-  if(class(try(fisher.test(cont_table),silent=T)) == "try-error"){
+      test_res <- fisher.test(cont_table,simulate.p.value = T)
+    }else{
+      test_res <- fisher.test(cont_table)
+    }
+  }
+  if(test_name == "chisq.test"){
+    test_res <- chisq.test(cont_table)
+  }
+  #make sure there is a matrix (enough values in both sides)
+  if(!is.null(dim(cont_table))){
+    cont_table_perc <-apply(cont_table,1,function(x) {
+      res <- x / sum(x) *100
+    })
+    cont_table_m <- melt(cont_table_perc)
+    cont_table_m$Var1 <- factor(cont_table_m$Var1)
+    p <- ggplot(data=cont_table_m, aes(x=Var2,y=value,fill=Var1,label=value))
+    p <- p + geom_bar(stat="identity",width=0.95)
+    #to reverse order of bars
+    #p <- p + geom_bar(stat="identity",width=0.95,position = position_stack(reverse = TRUE))
+    
+    if(geom_label){
+      if(text_position_side){
+        p <- p + geom_label(color="white",label = paste0(as.vector(t(cont_table))," (",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }else{
+        p <- p + geom_label(color="white",label = paste0(as.vector(t(cont_table)),"\n(",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }
+    }else{
+      if(text_position_side){
+        p <- p + geom_text(label = paste0(as.vector(t(cont_table))," (",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }else{
+        p <- p + geom_text(label = paste0(as.vector(t(cont_table)),"\n(",format(cont_table_m$value,digits = 1),"%)"),
+                       position = position_stack(vjust = .5),size=text_size)
+      }
+    }
+    
+    p <- p + theme_minimal()
+
+    if(any(!is.na(palette))){
+      p <- p + scale_fill_manual(values = palette)
+    }
+    #p <- p + theme(legend.title = element_blank())#,axis.text.x = element_text(angle = 25, hjust = 1))
+    p <- p + guides(fill=guide_legend(title=labs[3]))
+    if(hide_test){
+      p <- p + labs(subtitle=paste("p = ",format(test_res$p.value,digits=3),sep=" "),title=title,x=labs[1],y=labs[2])
+      if(test_res$p.value < 0.05 ) p <- p + theme(plot.subtitle=element_text(face="bold"))
+    }else{
+      p <- p + labs(subtitle=paste(test_name, " p = ",format(test_res$p.value,digits=3),sep=" "),title=title,x=labs[1],y=labs[2])
+      if(test_res$p.value < 0.05 ) p <- p + theme(plot.subtitle=element_text(face="bold"))
+    }
+
+    if(hide_legend){
+      p <- p + guides(fill=FALSE)
+    }
+  }else{
+    p <- ggplot()
+    test_res <-1
+  }
+  return(list(p,test_res,cont_table))
+
+}
+
+# Color palettes for consistency on plot
+##Get the color of the ggplot (stack overflow :https://stackoverflow.com/questions/8197559/emulate-ggplot2-default-color-palette)
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+## palette of R_NR factor
+pal_R_NR_HD <- gg_color_hue(3)
+names(pal_R_NR_HD)<-c("NR","R","HD")
+## palette used for heatmap will be used for all plots
+ColorPal<- list(Arm=c(`Nivo-Ipi`="#6A3D9A",
+                      Nivo="#1F78B4",
+                      TKI="#FFD92F"),
+                R_NR=c(R="#00BA38",
+                           NR="#F8766D",
+                       HD="#619CFF"),
+                sample_storage=c(FFPE="darkgrey",
+                                 Frozen="#E7298A"),
+                sample_type=c(`Tumor.T0`="black",
+                         `PBMC.T0`="#1F78B4",
+                         `PBMC.T6`="#E31A1C",
+                         `Tonsil.T0`="darkgrey"),
+                sample_type2=c(`Tumor.T0`="black",
+                         `PBMC.T0`="#1F78B4",
+                         `PBMC.T6`="#E31A1C",
+                         `PBMC.HD`="#6A3D9A"),
+                IgG_cat=c(`high IgG+ tumor cells`="#FF7F00",
+                          `low IgG+ tumor cells`="#1F78B4" ),
+                IgA_cat=c(`high IgA+ tumor cells`="#FDBF6F",
+                          `low IgA+ tumor cells`="#A6CEE3"),
+                IgG_IgA_var=c(`IgG_positive_tumor.cells`= "#FF7F00", 
+                              `IgA_positive_tumor.cells`="#619CFF" ))
+
+
+# Give the path of the Immcantation folder. With a back / at the end
+
+# ImmcantationFolder <- "PATH/"
+
+# Output folder to retrieve the files and plot
+res_folder <-"PATH/"
+```
+
+# Preprocess - Not rendered
+
+NB: See previous scripts : Figure 1 and Figure 4. For preprocess steps necessary to identify clonotypes and clones statistics.   
+
+
+## Shared clones across samples
+
+Evaluate clonotype/clone sharing across samples with a Change-O DefineClone method with threshold 0.15. This is used to get a clone.id similar across all samples.
+Then, the clone frequency should be re-evaluated with Alakazam by grouping by sample_id.
+
+### Prepare merged database
+
+Rename the previous clone_id column from clonal grouping at each individual samples to avoid error in the clonal grouping with DefineClone
+
+```{r,eval=FALSE}
+# reload Immunoverse IGH clone database (already merged)
+ImmcantationFolder_immunoverse <- "PATH/"
+Igh_imm_db<-qread(paste0(ImmcantationFolder_immunoverse,"03_ChangeO/02_PostIgBlastFilter/","20250714_Immcantation_IGH_clonal_grouped_merged_AllSamples.qs"))
+
+# Rename clone_id to Previous_clone_id_SPLITsamples to avoid confusion in the next run of Change-O
+Igh_imm_db$Previous_clone_id_SPLITsamples <- Igh_imm_db$clone_id
+Igh_imm_db <- Igh_imm_db[,setdiff(colnames(Igh_imm_db),"clone_id")]
+
+# Write merge db to run Change-O DefineClones after with threshold 0.15
+file_path <- paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260421_Immcantation_IGH_clonal_grouped_merged_AllSamples_AdjustFor2ndGrouping.tsv")
+write_rearrangement(data = Igh_imm_db,file = file_path)
+```
+
+
+### Define clones and create germline
+
+Define clone according to threshold 0.15. Create germline according to clone information.
+
+```{bash,eval=F}
+# put the script in a sh executable
+
+#!/bin/bash
+
+# Activate conda environment
+source PATH/conda.sh  # Adjust path if needed
+conda activate pRESTO
+
+Immcantation_dir="PATH/"
+
+cd ${Immcantation_dir}
+
+files="20260421_Immcantation_IGH_clonal_grouped_merged_AllSamples_AdjustFor2ndGrouping"
+
+# Start timing
+start_time=$(date +%s)
+start_date=$(date +"%Y-%m-%d %H:%M:%S")
+echo ">>> Pipeline started at: $start_date"
+
+for file in $files; do
+
+  echo $file
+  
+  # Use an homogeneized threshold for all grouping
+    threshold=0.15
+
+echo "Runing DefineClones.py"
+DefineClones.py -d "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}.tsv" --model ham --norm len --dist $threshold --mode gene --act set --nproc 20 --outdir "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/" --format airr --log "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}_DefineClone.log" > "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}_ChangeO_perf.log" 2>&1
+
+echo "Runing CreateGermlines.py"
+CreateGermlines.py -d "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}_clone-pass.tsv" -r PATH/germlines/imgt/human/vdj -g dmask --format airr --cloned --outdir "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/" >> "${Immcantation_dir}03_ChangeO/02_PostIgBlastFilter/${file}_ChangeO_perf.log" 2>&1
+
+done
+
+
+# End time and date
+end_time=$(date +%s)
+end_date=$(date +"%Y-%m-%d %H:%M:%S")
+duration=$((end_time - start_time))
+hours=$((duration / 3600))
+minutes=$(( (duration % 3600) / 60 ))
+seconds=$((duration % 60))
+
+# Final report
+echo ">>> Pipeline ended at: $end_date"
+echo ">>> Total runtime: ${hours}h ${minutes}m ${seconds}s (${duration} seconds)"
+
+# nano > Copy paste the script from the shebang to the done of the loop > 20260421_DefineClones_AcrossAllSamples_db.sh
+
+# As executable file
+chmod +x 20260421_DefineClones_AcrossAllSamples_db.sh
+
+# run the loop as nohup so that it do not keyboad interupt when the session disconnect
+nohup ./20260421_DefineClones_AcrossAllSamples_db.sh > ./20260421_DefineClones_AcrossAllSamples_db_loop_nohup.log 2>&1 &
+
+```
+
+```{r,eval=FALSE}
+# NB : database was loaded as follow
+# Igh_ICIunique_clonalGroup <- read_rearrangement(paste0(ImmcantationFolder,"03_ChangeO/02_PostIgBlastFilter/","20260421_Immcantation_IGH_clonal_grouped_merged_AllSamples_AdjustFor2ndGrouping_clone-pass_germ-pass.tsv"))
+
+# Then anonymized
+
+# then saved : 
+#saveRDS(object = Igh_ICIunique_clonalGroup,
+#      file = paste0("PATH/","20260728_Immcantation_IGH_clonal_grouped_merged_AllSamples_AdjustFor2ndGrouping_clone-pass_germ-pass_anonymized.rds"))
+
+
+```
+
+## CompAIRR
+
+Use the package [CompAIRR](https://github.com/uio-bmi/compairr/blob/main/README.md) in order to make exact comparisons between repertoires. Ultra fast.
+
+The code is multi-threaded. The number of threads may be specified with the **-t or --threads** option
+
+While the program is running it will print some status and progress information to standard error (stderr) unless a log file has been specified with the **-l or --log** option. Error messages and warnings will also be written here.
+
+The default is to **compare amino acid** sequences, but **nucleotide sequences are compared if the -n or --nucleotides** option is given
+
+Approximate comparison :
+The user can specify **how many differences are allowed when comparing sequences**, using the option **-d or --differences**. To allow i**ndels (insertions or deletions) the option -i or --indels** may be specified, otherwise only substitutions are allowed. By default, no differences are allowed. The -i option is allowed only when d=1. The number of differences allowed strongly influences the speed of CompAIRR. The program will be slower as more differences are allowed. When d=0 or d=1 it is very fast, but it will be relatively slow with d=2 and even slower when d>2. See the section on performance below for an example.
+
+### Install CompAIRR
+
+```{bash,eval=F}
+# the binary for the latest release is downloaded directly from the website
+## Binaries for Linux (x86_64) and macOS (x86_64 and Arm64) are also distributed with each release.
+cd PATH
+wget https://github.com/uio-bmi/compairr/releases/download/v1.13.0/compairr-1.13.0-linux-x86_64
+
+## create a copy and adjust name
+cp compairr-1.13.0-linux-x86_64 compairr
+
+## modify as exec file
+chmod +x compairr
+
+## move to a folder in $PATH
+mv compairr PATH
+
+## test help
+compairr --help ## is working :)
+```
+
+### Repertoire vs repertoire comparisons
+
+Reproduce the vignette from the [tutorial](https://github.com/LonnekeScheffer/compairr-tutorial)
+
+#### Generate an input for CompAIRR
+
+For each of the **two repertoire sets** there must an input file of tab-separated values formatted according to the AIRR standard for rearrangements. The two input files are specified on the command line without any preceding option letter. **If only one filename is specified on the command line, or the same filename is specified twice, it is assumed that the set should be compared to itself**. Each file must contain the repertoire ID and either the nucleotide or the amino acid sequence of the rearrangement. If the repertoire ID column is missing, all sequences are assumed to belong to the same repertoire (with ID 1 or 2, respectively, for the two sets). A sequence ID may also be included. Unless they should be ignored, the V gene, the J gene, and the duplicate count is also needed.
+
+For repertoire comparisons, the input should be a tsv file containing all sequences from all repertoire to compared in one table, with one column specifying the repertoire of origin. The field necessary are : junction_aa,	duplicate_count,	v_call,	j_call,	repertoire_id
+
+```{r,eval=FALSE}
+# Generate a table for IG and 3 table for each loci
+compAirr_table <- airr_imm_db
+
+# NB; after deduplication in CompAirr, sequences with multiple v_call or multiple j_call can be split at the end although probably due to sequence length ..
+# e.g. :IGHV4-59*01,IGHV4-59*02,IGHV4-59*07 vs  IGHV4-59*01,IGHV4-59*07 (IGHV4-59*02 in more but not really relevent here ... )
+# repertoire_id duplicate_count v_call                              j_call            junction_aa           
+#   <chr>                   <int> <chr>                               <chr>             <chr>                 
+# 1 Tonsil_ffpe                 7 IGHV4-59*01,IGHV4-59*07             IGHJ5*01,IGHJ5*02 CARSRSCDNARCYDDFNWFAPW
+# 2 Tonsil_ffpe                11 IGHV4-59*01,IGHV4-59*02,IGHV4-59*07 IGHJ5*01,IGHJ5*02 CARSRSCDNARCYDDFNWFAPW
+
+### Fill v_call/j_call in input for CompAIRR with v_gene/j_gene (from alakazam::getGene) in order to allow more de-duplication before CompAIRR
+compAirr_table$v_call <- compAirr_table$v_gene
+compAirr_table$j_call <- compAirr_table$j_gene
+
+## Add duplicate_count : umi_count
+compAirr_table$duplicate_count <- compAirr_table$umi_count
+
+## Add repertoire_id : sample_id
+compAirr_table$repertoire_id <- compAirr_table$sample_id
+
+### Split by locus
+compAirr_table_list <- split(compAirr_table,compAirr_table$locus)
+
+## Write repertoire in CompAIRR directory
+#### Full IG
+write_rearrangement(compAirr_table,
+                    file = paste0(ImmcantationFolder,"03_ChangeO/04_CompAIRR/","Immunoverse_all_IG_all_105samples_ToDedup.tsv"))
+
+#### IGH
+write_rearrangement(compAirr_table_list$IGH,
+                    file = paste0(ImmcantationFolder,"03_ChangeO/04_CompAIRR/","Immunoverse_all_IGH_all_105samples_ToDedup.tsv"))
+
+#### IGK
+write_rearrangement(compAirr_table_list$IGK,
+                    file = paste0(ImmcantationFolder,"03_ChangeO/04_CompAIRR/","Immunoverse_all_IGK_all_105samples_ToDedup.tsv"))
+
+#### IGL
+write_rearrangement(compAirr_table_list$IGL,
+                    file = paste0(ImmcantationFolder,"03_ChangeO/04_CompAIRR/","Immunoverse_all_IGL_all_105samples_ToDedup.tsv"))
+
+```
+
+
+#### Deduplicate before CompAIRR
+
+Because the repertoires contain duplicates, which may for example happen if different nucleotide sequences resolve to the same amino acid sequence,CompAIRR has a function to remove duplicates. The duplicate_count values for duplicates are summed. A match has been counted if both the CDR3 sequence and V and J genes are matching.
+
+```{bash,eval=F}
+cd PATH/03_ChangeO/04_CompAIRR
+
+#### add  -u to ignore illegal character X on aa junction which means any amino acid, and come from a nucleotide N in the junction. So remove these sequences
+
+## All IG
+compairr -u --deduplicate --out Immunoverse_all_IG_all_105samples_inputCompAIRR.tsv Immunoverse_all_IG_all_105samples_ToDedup.tsv
+
+## All IGH
+compairr -u --deduplicate --out Immunoverse_all_IGH_all_105samples_inputCompAIRR.tsv Immunoverse_all_IGH_all_105samples_ToDedup.tsv
+
+## All IGK
+compairr -u --deduplicate --out Immunoverse_all_IGK_all_105samples_inputCompAIRR.tsv Immunoverse_all_IGK_all_105samples_ToDedup.tsv
+
+## All IGL
+compairr -u --deduplicate --out Immunoverse_all_IGL_all_105samples_inputCompAIRR.tsv Immunoverse_all_IGL_all_105samples_ToDedup.tsv
+```
+
+#### Run CompAIRR
+
+By default, the values in the output matrix represent the sum of product of duplicate counts of matching sequences. We can change this by choosing a different --score parameter value. For example, we can instead compute the sum of minimum duplicate counts (take the minimum count between two matching sequences) by setting --score min:
+
+Alternatively, if we are just interested in knowing the number of matching clonotypes while ignoring their counts, this can be done by specifying --ignore-counts.
+
+If you are interested in knowing which sequences are overlapping, add the --pairs argument. If the -p or --pairs option is specified, CompAIRR will write information about all pairs of matching sequences to a specified TSV file. Please note that such **files may grow very large when there are many matches**.
+
+Instead of computing the raw number of overlapping sequences, we can also compute a similarity score: Morisita-Horn (--score MH) or Jaccard (--score Jaccard).
+
+Now we can try to compute the Morisita-Horn distance matrix again, but with the deduplicated input file, and the MH score no longer exceed 1. The Morisita-Horn index or Jaccard index will be calculated if MH or Jaccard is specified with the -s option. These indices can only be computed when d=0.
+
+NB:
+An alternative output format is used when the -a or --alternative option is specified. It will write the results in a three column format with the repertoire ID from set 1 and set 2 in the two first columns, respectively, and the value in the third column. There will be one line for each combination of repertoires in the sets. The very first line will contain a hash character (#) followed by the field names separated by tabs.
+
+
+```{bash,eval=F}
+Immcantation_dir="PATH/03_ChangeO/04_CompAIRR/"
+chains="IG IGH IGK IGL"
+
+for locus in $chains; do
+
+  echo $locus
+  
+  echo "sum dup count shared"
+  # Compute the sum of duplicate count of matching sequences
+  compairr --matrix "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_inputCompAIRR.tsv" \
+    --out "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_outputCompAIRR_matrix_SumDupCountShared.txt" \
+    --log "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_outputCompAIRR_matrix_SumDupCountShared.log" \
+    --threads 6
+  
+  echo "num uniq shared"
+  # Compute the numnber of matching clonotypes (irrespective of count)
+  compairr --matrix "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_inputCompAIRR.tsv" \
+  --ignore-counts \
+    --out "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_outputCompAIRR_matrix_NumUniqShared.txt" \
+    --log "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_outputCompAIRR_matrix_NumUniqShared.log" \
+    --threads 6
+  
+  # Keep the list of pair of clonotypes shared between repertoires
+  #compairr --matrix --out out.txt --pairs pairs.txt emerson.tsv
+  
+  echo "MH score"
+  # Compute MH score
+  compairr --matrix "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_inputCompAIRR.tsv" \
+  --score MH \
+    --out "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_outputCompAIRR_matrix_MHscore.txt" \
+    --log "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_outputCompAIRR_matrix_MHscore.log" \
+    --threads 6
+  
+  echo "Jaccard score"
+  # Compute Jaccard score
+  compairr --matrix "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_inputCompAIRR.tsv" \
+  --score Jaccard \
+    --out "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_outputCompAIRR_matrix_JACCARDscore.txt" \
+    --log "${Immcantation_dir}Immunoverse_all_${locus}_all_105samples_outputCompAIRR_matrix_JACCARDscore.log" \
+    --threads 6
+
+done
+```
+
+
+#### Generate a merged list with all CompAIRR results
+
+Prepare metadata and load compAirr results
+
+```{r,eval=FALSE}
+# CompAirr results : 4 run * 4 levels (IG/IGH/IGK/IGL) : 16 results
+compAirr_results <- list.files(path = paste0(ImmcantationFolder,"03_ChangeO/04_CompAIRR"),
+                               pattern = "outputCompAIRR.*txt",
+                               full.names = T)
+
+## by chain 
+chain<-gsub("_all_105.*","",gsub(".*_all_I","I",compAirr_results))
+
+### by variable
+var<-gsub(".txt","",gsub(".*matrix_","",compAirr_results))
+
+# Load the matrix and store the results in a list
+compAirr_results <- lapply(compAirr_results,function(path){
+  read.delim(path,header = T,row.names = 1)
+})
+names(compAirr_results)<-paste(chain,var,sep = "_")
+
+### After ID anonymization, saved as : 
+# saveRDS(object = compAirr_results,
+#       file = paste0("PATH/","20260728_CompAIRR_results_list_anonymized.rds"))
+```
+
+
+# Reload merged dataset
+
+Reload data
+
+```{r}
+# Metadata ANONYMIZED - NB : Response to ICI is not shared due to patient privacy requirement but can be asked to the study sponsor unpon reasonable request (see article for contact)
+Immcantation_meta_ICI_unique <-readRDS(paste0("PATH/","20260723_Immunoverse_Metadata_AnonymId_ICIresponse.rds")) # edit : study sponsor accepted to share the information
+
+
+## load igh clonotype table with clonal group updated 
+Igh_ICIunique_clonalGroup <- readRDS(paste0(res_folder,"20260728_Immcantation_IGH_clonal_grouped_merged_AllSamples_AdjustFor2ndGrouping_clone-pass_germ-pass_anonymized.rds"))
+
+## Merge with metadata containing notably response to ICI (to reproduce Figure 6)
+Igh_ICIunique_clonalGroup<-merge(Igh_ICIunique_clonalGroup,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type" ,"sample_type2","R_NR")],by="sample_id")
+
+
+# reload full dataset of bulk RNAseq on frozen tumors (MiXCR reconstruction, see Figure1) > Used in S12 figure
+OrderIso <- c("IGHM","IGHD","IGHG3","IGHG1","IGHA1","IGHG2","IGHG4","IGHE","IGHA2","IGH_NA")
+
+clonotype_bulk_muts_bionikk <- readRDS(file = paste0("PATH/","clonotype_bulk_muts_bionikk_merged.rds"))
+# define levels of chains (here named type ...)
+clonotype_bulk_muts_bionikk$type <- factor(clonotype_bulk_muts_bionikk$type,
+                                           levels = c("IGH","IGK" ,"IGL" ,
+                                                      "TRA", "TRB" ,"TRG" ,"TRD"))
+# Define isotypes 
+clonotype_bulk_muts_bionikk$isotype <- factor(clonotype_bulk_muts_bionikk$isotype,
+                                           levels = c(OrderIso,setdiff(unique(clonotype_bulk_muts_bionikk$isotype),OrderIso)))
+
+
+
+
+### CompAIRR results >> Figure S13
+compAirr_results<- readRDS(paste0(res_folder,"20260728_CompAIRR_results_list_anonymized.rds"))
+
+```
+
+
+
+
+# Figures
+
+## Figure 6A - Experimental scheme (biorender)
+
+**Figure 6A compressed > see paper ...** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure6A_to_render_compressed.pdf"),density = 300)
+plot(img)
+```
+
+## Figure 6B, 6C, 6D - Clones shared
+
+Clones shared between samples & patients - Intra- vs Inter-patient sharing
+
+```{r}
+#NB : adjust Maxime function to add a parameter to hide 0 value if there are some
+plot_contingency2 <- function(data,
+           variables = c("TLS_pos", "HBV"),
+           hide_zero = FALSE, # Hide the 0 counts
+           hide_legend = F,
+           text_size=6,
+           text_position_side=T,
+           create_labels = T,
+           inverse_factor2=F,
+           order_factor=NULL,
+           palette = NA,
+           geom_label=F,
+           test_name = c("chisq.test", "fisher.test")[1],
+           labs = c(xlab = "",
+                    ylab = "",
+                    legend_title = ""),
+           hide_test = F,
+           title = ""){
+    if(inverse_factor2){
+      data[,variables[2]] <- factor(data[,variables[2]],levels=rev(levels(data[,variables[2]])))
+    }
+    cont_table <- table(data[,variables[1]],data[,variables[2]])
+    #clean data table to avoid empty rows
+    non_empty_rows <- rowSums(cont_table)!=0
+    cont_table <- cont_table[non_empty_rows,]
+
+    if(create_labels){
+      #sapply(levels(factor(data[,variables[2]])), function(x) paste(variables[2],x,sep="_"))
+      colnames(cont_table) <- sapply(levels(factor(data[,variables[2]])), function(x) paste(variables[2],x,sep="_"))
+      rownames(cont_table) <- sapply(levels(factor(data[,variables[1]])), function(x) paste(variables[1],x,sep="_"))
+    }
+  if(test_name != "fisher.test" & test_name != "chisq.test"){
+    stop("incorrect test, valid options are fisher.test or chisq.test")
+  }
+  if(test_name == "fisher.test"){
+    error_test <-  if(class(try(fisher.test(cont_table),silent=T)) == "try-error"){
+      test_res <- fisher.test(cont_table,simulate.p.value = T)
+    }else{
+      test_res <- fisher.test(cont_table)
+    }
+  }
+  if(test_name == "chisq.test"){
+    test_res <- chisq.test(cont_table)
+  }
+  #make sure there is a matrix (enough values in both sides)
+  if(!is.null(dim(cont_table))){
+    cont_table_perc <-apply(cont_table,1,function(x) {
+      res <- x / sum(x) *100
+    })
+    cont_table_m <- melt(cont_table_perc)
+    cont_table_m$Var1 <- factor(cont_table_m$Var1)
+    
+    #### modif
+    # create labels
+    labels_vec <- paste0(as.vector(t(cont_table)),
+                         ifelse(text_position_side, " (", "\n("),
+                         format(cont_table_m$value, digits = 1),
+                         "%)")
+    # hide zero labels if requested
+    if(hide_zero){
+      zero_idx <- as.vector(t(cont_table)) == 0
+      labels_vec[zero_idx] <- ""
+    }
+    
+    p <- ggplot(data=cont_table_m, aes(x=Var2,y=value,fill=Var1,label=value))
+    p <- p + geom_bar(stat="identity",width=0.95)
+    #to reverse order of bars
+    #p <- p + geom_bar(stat="identity",width=0.95,position = position_stack(reverse = TRUE))
+    
+    if(geom_label){
+      if(text_position_side){
+        p <- p + geom_label(color="white",label = labels_vec,
+                       position = position_stack(vjust = .5),size=text_size)
+      }else{
+        p <- p + geom_label(color="white",label = labels_vec,
+                       position = position_stack(vjust = .5),size=text_size)
+      }
+    }else{
+      if(text_position_side){
+        p <- p + geom_text(label = labels_vec,
+                       position = position_stack(vjust = .5),size=text_size)
+      }else{
+        p <- p + geom_text(label = labels_vec,
+                       position = position_stack(vjust = .5),size=text_size)
+      }
+    }
+    
+    p <- p + theme_minimal()
+
+    if(any(!is.na(palette))){
+      p <- p + scale_fill_manual(values = palette)
+    }
+    #p <- p + theme(legend.title = element_blank())#,axis.text.x = element_text(angle = 25, hjust = 1))
+    p <- p + guides(fill=guide_legend(title=labs[3]))
+    if(hide_test){
+      p <- p + labs(subtitle=paste("p = ",format(test_res$p.value,digits=3),sep=" "),title=title,x=labs[1],y=labs[2])
+      if(test_res$p.value < 0.05 ) p <- p + theme(plot.subtitle=element_text(face="bold"))
+    }else{
+      p <- p + labs(subtitle=paste(test_name, " p = ",format(test_res$p.value,digits=3),sep=" "),title=title,x=labs[1],y=labs[2])
+      if(test_res$p.value < 0.05 ) p <- p + theme(plot.subtitle=element_text(face="bold"))
+    }
+
+    if(hide_legend){
+      p <- p + guides(fill=FALSE)
+    }
+  }else{
+    p <- ggplot()
+    test_res <-1
+  }
+  return(list(p,test_res,cont_table))
+
+}
+```
+
+
+```{r}
+##### NB : some part of the script are not usefull for the final selected plot ... kept for consistency in the strategy ...
+
+# count number of clonotypes / clone and total UMI by clone
+Clone_x_Sample_merged <- Igh_ICIunique_clonalGroup %>%
+  group_by(sample_id, clone_id) %>%
+  summarise(
+    NumberClonotype = n(),
+    TotalUMI = sum(umi_count, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sample_clone = paste(sample_id, clone_id, sep = "-")
+  )
+
+
+######### MERGE CLONE FREQUENCY WITH CLINICAL INFO 
+Clone_x_Sample_merged <- merge(Clone_x_Sample_merged,
+                        Immcantation_meta_ICI_unique[,c("sample_id","patient_id","R_NR","sample_type","sample_type2")],by="sample_id",all.x=T)
+
+
+
+#########@#########@#########@#########@#########@#########@
+## Barplot of each clone shared ratio response per sample type (split Tumor / T0 / T6)
+#########@#########@#########@#########@#########@#########@
+
+### Count number of R / NR patient by clone_id in each individual sample type (ie:  shared in different patient)
+Clone_summary <- Clone_x_Sample_merged %>%
+  distinct(clone_id,
+           sample_type2,
+           patient_id,
+           R_NR) %>%
+  group_by(clone_id, sample_type2) %>%
+  summarise(
+    Number_DifferentPatient = n(),
+    Number_R = sum(R_NR == "R"),
+    Number_NR = sum(R_NR == "NR"),
+    Ratio_R = Number_R / Number_DifferentPatient,
+    .groups = "drop"
+  )
+
+Clone_summary <- Clone_summary[!(Clone_summary$sample_type2 %in% "PBMC.HD"),] # remove HD
+Clone_summary$sample_type2 <- factor(as.character(Clone_summary$sample_type2),
+                                     levels =setdiff(levels(Clone_summary$sample_type2),"PBMC.HD") )
+
+Sharing_df <- Clone_summary %>%
+  filter(Number_DifferentPatient > 1) %>%
+  count(sample_type2,
+        Number_DifferentPatient,
+        name="Freq")
+
+Nb_samples <- table(unique(Clone_x_Sample_merged[,c("sample_type2","sample_id")])$sample_type2)
+Nb_samples <- Nb_samples[setdiff(names(Nb_samples),"PBMC.HD")] # remove HD
+
+p <- ggplot(Sharing_df,aes(x=Number_DifferentPatient,y=Freq,fill=sample_type2))+
+  geom_col()+
+  geom_text(aes(label=Freq),vjust=+1,size=2,color="white")+
+  facet_grid(sample_type2~.,drop = T)+
+  scale_fill_manual(values = ColorPal$sample_type2)+
+  scale_y_continuous(trans = "log1p",breaks = base_breaksLog1p(),labels = prettyNum)+
+  theme_classic()+
+  labs(x="Number of samples sharing each unique clone",
+       y="Number of clones",fill="Sample type",
+       title="Sharing of clone between different patients",
+       subtitle = paste(names(Nb_samples),Nb_samples,sep = ":",collapse = " ; "))
+
+###### THIS IS FIGURE 6B
+ggsave(plot = p,
+       filename = paste0(res_folder,"Figure6B_20260427_NbClones_SharedBetweenPatients_split_by_sampleTypes.pdf"),
+       width = 8,height = 4)
+
+# plot Ratio resp (value) for each clone_id (x) split by total sample and sample_type (grid  or patchwork?)
+# Create a concatenate vector between R_NR and sample_type
+Clone_x_Sample_merged$sample_type_Resp <- paste(Clone_x_Sample_merged$sample_type,
+                                         Clone_x_Sample_merged$R_NR,
+                                         sep = "-")
+
+## get sample Nb by resp
+Nb_samples <- table(unique(Clone_x_Sample_merged[,c("sample_type_Resp","sample_id")])$sample_type_Resp)
+Nb_samples <- Nb_samples[setdiff(names(Nb_samples),"PBMC.T0-HD")] # remove HD
+
+#### Plot ratio of response only as a violin plot
+Ratio_df <- Clone_summary %>%
+  filter(Number_DifferentPatient > 1)
+Ratio_df$Number_DifferentPatient_factor <- factor(Ratio_df$Number_DifferentPatient)
+
+### represent one point / ratioR at each level of x_axis factor (Nb sample sharing) with the size of the dot corresponding to the number of clone at this specific ratio/NbSample
+df_tmp <- table(Ratio_R=Ratio_df$Ratio_R,Number_DifferentPatient_factor=Ratio_df$Number_DifferentPatient_factor,sample_type2=Ratio_df$sample_type2)
+df_tmp <- apply(df_tmp,3,function(tmp)data.frame(as.table(tmp)),simplify = F)
+df_tmp <- lapply(names(df_tmp),function(sampletype){
+  tmptmp <- df_tmp[[sampletype]]
+  tmptmp$sample_type2 <-sampletype
+  tmptmp
+})
+df_tmp <- Reduce(rbind,df_tmp)
+
+df_tmp$Ratio_R <- as.numeric(as.character(df_tmp$Ratio_R)) # get back numeric scale
+
+df_tmp <- df_tmp[df_tmp$Freq !=0,] # remove 0
+
+df_tmp$sample_type2 <- factor(df_tmp$sample_type2,levels = setdiff(levels(Clone_x_Sample_merged$sample_type2),"PBMC.HD"))
+
+
+p<-ggplot(df_tmp,aes(x=Number_DifferentPatient_factor,y=Ratio_R))+
+  geom_hline(yintercept = Nb_samples["Tumor.T0-R"]/(Nb_samples["Tumor.T0-R"]+Nb_samples["Tumor.T0-NR"]),color="blue")+
+  geom_point(aes(size=Freq,fill=Ratio_R),shape=21)+
+  facet_grid(.~sample_type2,drop = T,scales = "free")+
+  theme_bw()+
+   theme(
+     axis.text.x = element_text(size=7),
+  )+
+    scale_fill_distiller(palette="RdYlGn",direction=+1)+
+  scale_size_continuous(trans = "log10",breaks = base_breaksLog10(),labels = prettyNum)+
+  labs(x="Number of samples sharing each unique clone",
+       fill="Ratio of R",size="Nb clones",
+       y="Ratio of R patients for each shared clone",
+      title="Sharing of clone between different patients",
+      subtitle = paste(names(Nb_samples),Nb_samples,sep = ":",collapse = " ; "),
+      caption = "blue line: ratio of responders among all patients analyzed")
+
+##### THIS IS FIGURE 6D
+ggsave(plot = p,
+       filename = paste0(res_folder,"Figure6D_20260427_NbClones_SharedBetweenPatients_DotPlotRatioResponse_SizeNbClone_split_by_sampleTypes.pdf"),
+       width = 12,height = 4)
+
+
+################################################
+# Annotate back the Clone_x_Sample_merged table with ratio response by clone_id
+################################################
+Clone_x_Sample_merged <-
+    Clone_x_Sample_merged %>%
+    left_join(
+        Clone_summary,
+        by=c("clone_id","sample_type2")
+    )
+
+
+##################################################
+## Clone only shared in a patient Tumor and Blood samples - Intra-patient sharing
+##################################################
+Patient_summary <- Clone_x_Sample_merged %>%
+  distinct(patient_id,
+           clone_id,
+           sample_type2) %>%
+  group_by(patient_id, clone_id) %>%
+  summarise(
+      Number_DifferentSamples = n(),
+      Sample_list =
+          paste(sort(sample_type2),
+                collapse="_"),
+      .groups="drop"
+  )
+
+#################### #################### #################### 
+### Annotate the global table with Number of sample in patients sharing the clone (Tum-T0 / T0-T6 / Tum-T6 / Tum-T0-T6)
+##### Answer the question : in clone shared across multiple patients (e.g: in 9 tumor from responsive patients) >> Are they also shared in tumor and blood from the same patient
+#################### #################### #################### 
+
+Clone_x_Sample_merged <-
+    Clone_x_Sample_merged %>%
+    left_join(Patient_summary,
+              by=c("patient_id","clone_id"))
+
+
+
+###@ convert Nb in factor for the x axis of plot
+Clone_x_Sample_merged$Number_DifferentSamples_onlySamePatientFactor <- factor(Clone_x_Sample_merged$Number_DifferentSamples) # convert in factor to plot
+
+Clone_x_Sample_merged$Number_DifferentPatient_onlySameSampleTypeFactor <- factor(Clone_x_Sample_merged$Number_DifferentPatient) # convert in factor to plot
+
+
+### contingency
+
+pTum <- plot_contingency2(Clone_x_Sample_merged[Clone_x_Sample_merged$sample_type2 %in% "Tumor.T0",],
+                       variables = c("Number_DifferentPatient_onlySameSampleTypeFactor",
+                                     "Number_DifferentSamples_onlySamePatientFactor"),
+                       create_labels = F,
+                       test_name ="fisher.test" ,
+                       labs = c("Number of patients sharing a clone",
+                                "Percentage of 'clones x patients' (%)",
+                                "Number of\nsamples\nin a patient"),
+                       title = "Tumor.T0",
+                       text_position_side = F,
+                       text_size = 3)
+
+pT0 <- plot_contingency2(Clone_x_Sample_merged[Clone_x_Sample_merged$sample_type2 %in% "PBMC.T0",],
+                       variables = c("Number_DifferentPatient_onlySameSampleTypeFactor",
+                                     "Number_DifferentSamples_onlySamePatientFactor"),
+                       create_labels = F,
+                       test_name ="fisher.test" ,
+                       labs = c("Number of patients sharing a clone",
+                                "Percentage of 'clones x patients' (%)",
+                                "Number of\nsamples\nin a patient"),
+                       title = "PBMC.T0",
+                       text_position_side = F,
+                       text_size = 3)
+
+
+pT6 <- plot_contingency2(Clone_x_Sample_merged[Clone_x_Sample_merged$sample_type2 %in% "PBMC.T6",],
+                       variables = c("Number_DifferentPatient_onlySameSampleTypeFactor",
+                                     "Number_DifferentSamples_onlySamePatientFactor"),
+                       create_labels = F,
+                       test_name ="fisher.test" ,
+                       labs = c("Number of patients sharing a clone",
+                                "Percentage of 'clones x patients' (%)",
+                                "Number of\nsamples\nin a patient"),
+                       title = "PBMC.T6",
+                       text_position_side = F,
+                       text_size = 3)
+
+p <- (pTum[[1]] / pT0[[1]] / pT6[[1]])+
+  plot_layout(guides = "collect",axes = "collect")+
+  plot_annotation(title ="Inter-patient vs intra-patient sharing of clones",
+       subtitle = paste(names(Nb_samples),Nb_samples,sep = ":",collapse = " ; "),
+       caption = "e.g.: if 2 clones are shared between 20 patients, then total is 40")
+
+
+#### THIS IS FIGURE 6C
+ggsave(plot = p,
+       filename = paste0(res_folder,"Figure6C_20260519_Clones_Shared_DifferentSampleSamePatient_vs_DifferentPatientSameSampleType_Contingency_NotSplitResponseICI.pdf"),
+       width = 12,height = 10)
+
+
+#### Same but without number printed
+
+pTum <- plot_contingency2(Clone_x_Sample_merged[Clone_x_Sample_merged$sample_type2 %in% "Tumor.T0",],
+                       variables = c("Number_DifferentPatient_onlySameSampleTypeFactor",
+                                     "Number_DifferentSamples_onlySamePatientFactor"),
+                       create_labels = F,
+                       test_name ="fisher.test" ,
+                       labs = c("Number of patients sharing a clone",
+                                "Percentage of 'clones x patients' (%)",
+                                "Number of\nsamples\nin a patient"),
+                       title = "Tumor.T0",
+                       text_position_side = F,
+                       text_size = 0)
+
+pT0 <- plot_contingency2(Clone_x_Sample_merged[Clone_x_Sample_merged$sample_type2 %in% "PBMC.T0",],
+                       variables = c("Number_DifferentPatient_onlySameSampleTypeFactor",
+                                     "Number_DifferentSamples_onlySamePatientFactor"),
+                       create_labels = F,
+                       test_name ="fisher.test" ,
+                       labs = c("Number of patients sharing a clone",
+                                "Percentage of 'clones x patients' (%)",
+                                "Number of\nsamples\nin a patient"),
+                       title = "PBMC.T0",
+                       text_position_side = F,
+                       text_size = 0)
+
+
+pT6 <- plot_contingency2(Clone_x_Sample_merged[Clone_x_Sample_merged$sample_type2 %in% "PBMC.T6",],
+                       variables = c("Number_DifferentPatient_onlySameSampleTypeFactor",
+                                     "Number_DifferentSamples_onlySamePatientFactor"),
+                       create_labels = F,
+                       test_name ="fisher.test" ,
+                       labs = c("Number of patients sharing a clone",
+                                "Percentage of 'clones x patients' (%)",
+                                "Number of\nsamples\nin a patient"),
+                       title = "PBMC.T6",
+                       text_position_side = F,
+                       text_size = 0)
+
+p <- (pTum[[1]] / pT0[[1]] / pT6[[1]])+
+  plot_layout(guides = "collect",axes = "collect")+
+  plot_annotation(title ="Inter-patient vs intra-patient sharing of clones",
+       subtitle = paste(names(Nb_samples),Nb_samples,sep = ":",collapse = " ; "),
+       caption = "e.g.: if 2 clones are shared between 20 patients, then total is 40")
+
+
+#### THIS IS FIGURE 6C
+ggsave(plot = p,
+       filename = paste0(res_folder,"Figure6C_20260519_Clones_Shared_DifferentSampleSamePatient_vs_DifferentPatientSameSampleType_Contingency_NotSplitResponseICI_noNumbers.pdf"),
+       width = 12,height = 10)
+
+
+
+### Same but add category of sample in which it is found
+Clone_x_Sample_merged$Sample_list <- factor(Clone_x_Sample_merged$Sample_list,
+     levels = c("Tumor.T0","PBMC.T0","PBMC.T6","PBMC.HD",
+                "Tumor.T0_PBMC.T0","Tumor.T0_PBMC.T6","PBMC.T0_PBMC.T6",
+                "Tumor.T0_PBMC.T0_PBMC.T6")) # define level
+### Provided but not included in final article ... 
+##### try contingency
+pTum <- plot_contingency2(Clone_x_Sample_merged[Clone_x_Sample_merged$sample_type2 %in% "Tumor.T0",],
+                       variables = c("Number_DifferentPatient_onlySameSampleTypeFactor",
+                                     "Sample_list"),
+                       create_labels = F,
+                       test_name ="fisher.test" ,
+                       labs = c("Number of patients sharing a clone",
+                                "Percentage of 'clones x patients' (%)",
+                                "List of\nsamples\nin a patient"),
+                       title = "Tumor.T0",
+                       text_position_side = F,
+                       text_size = 3)
+
+
+pT0 <- plot_contingency2(Clone_x_Sample_merged[Clone_x_Sample_merged$sample_type2 %in% "PBMC.T0",],
+                       variables = c("Number_DifferentPatient_onlySameSampleTypeFactor",
+                                     "Sample_list"),
+                       create_labels = F,
+                       test_name ="fisher.test" ,
+                       labs = c("Number of patients sharing a clone",
+                                "Percentage of 'clones x patients' (%)",
+                                "List of\nsamples\nin a patient"),
+                       title = "PBMC.T0",
+                       text_position_side = F,
+                       text_size = 3)
+
+
+pT6 <- plot_contingency2(Clone_x_Sample_merged[Clone_x_Sample_merged$sample_type2 %in% "PBMC.T6",],
+                       variables = c("Number_DifferentPatient_onlySameSampleTypeFactor",
+                                     "Sample_list"),
+                       create_labels = F,
+                       test_name ="fisher.test" ,
+                       labs = c("Number of patients sharing a clone",
+                                "Percentage of 'clones x patients' (%)",
+                                "List of\nsamples\nin a patient"),
+                       title = "PBMC.T6",
+                       text_position_side = F,
+                       text_size = 3)
+
+p <- (pTum[[1]] / pT0[[1]] / pT6[[1]])+
+  plot_layout(guides = "collect",axes = "collect")+
+  plot_annotation(title ="Inter-patient vs intra-patient sharing of clones",
+       subtitle = paste(names(Nb_samples),Nb_samples,sep = ":",collapse = " ; "),
+       caption = "e.g.: if 2 clones are shared between 20 patients, then total is 40")
+
+
+```
+
+
+**Figure 6B** 
+```{r,fig.height=8,fig.width=8}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure6B_20260427_NbClones_SharedBetweenPatients_split_by_sampleTypes.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure 6C** 
+```{r,fig.height=12,fig.width=12}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure6C_20260519_Clones_Shared_DifferentSampleSamePatient_vs_DifferentPatientSameSampleType_Contingency_NotSplitResponseICI_noNumbers.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure 6D** 
+```{r,fig.height=12,fig.width=12}
+img <- magick::image_read_pdf(paste0(res_folder,"Figure6D_20260427_NbClones_SharedBetweenPatients_DotPlotRatioResponse_SizeNbClone_split_by_sampleTypes.pdf"),density = 300)
+plot(img)
+```
+
+
+## Figure S12 - Bulk RNAseq - search same CDR3 in multiple tumors
+
+**Figure S12** : Search same CDR3 in multiple tumors and stratify according to ICI treatment response. NB : script is provided but clinical data are not deposited due to patient privacy requirement.
+
+To search for similar clonotypes in different tumors (different patients) and associate these shared/public clonotypes with response to ICI. 
+
+Note : this script can not be reproduced without the clinical data of the BioniKK cohort (not directly available due to patient privacy requirement).
+
+
+```{r}
+# NB : this chunk is only to get the original metadata with clinical information. 
+### Added before anonymization and removing the clinical data from the deposited metadata file.
+load("PATH/Bionikk_metadata.RData")
+Bionikk_metadata <-Bionikk_metadata[!(Bionikk_metadata$RNAseqID %in% c("LRHX114","LRHX19")),] # Remove the two (LRHX114 and LRHX19) RNAseq data (unclear origin ...) : 
+Bionikk_metadata$Anonym_ID <- Bionikk_metadata$RNAseqID # same column
+```
+
+
+```{r}
+# filter only on samples from patients treated with ICI 
+## Arm column == bionikk treatment ARM (see Vano et al, 2022, Lancet Oncol)
+## R_NR == RECIST best response R (CR|PR) or NR (SD|PD)
+clonotype_bulk_muts_bionikk <- merge(clonotype_bulk_muts_bionikk,Bionikk_metadata[,c("Anonym_ID","ID_PMR","ID","Primary_Meta_Frozen","Primary_Meta_FFPE","FFPE_tissue_type","Arm","R_NR")],by.x="sampleid",all.x=T,by.y="Anonym_ID")
+clonotype_bulk_muts_bionikk<-clonotype_bulk_muts_bionikk[clonotype_bulk_muts_bionikk$Arm %in% c("A","B"),]
+```
+
+
+```{r}
+# Function : Compute Number of sample in which each clonotypes is found
+## the overlap is computed based on CD3aa sequence
+## type argument specify if the overlap should be done on IG clonotypes ("IG"), TCR clonotypes ("TCR"), or on all clonotypes ("ALL")
+## id_column : name of the column containing each sample id
+
+shared_clonotypes <- function(ClonotypeDf=clonotype_bulk_muts_bionikk,
+                                  # type = "IG",
+                                  id_column="sampleid",
+                                  response_column = "R_NR") {
+  #subset according to specified type
+  # if(type == "IG"){
+  #   ClonotypeDf <- ClonotypeDf[ClonotypeDf$type %in% c("IGK" ,"IGL" ,"IGH"),]
+  # }else if(type == "TCR"){
+  #   ClonotypeDf <- ClonotypeDf[ClonotypeDf$type %in% c("TRA", "TRB" ,"TRG", "TRD"),]
+  # }
+  
+  # Finally only on IGH
+  ClonotypeDf <- ClonotypeDf[ClonotypeDf$type %in% c("IGH"),]
+  
+  ## split according to aaSeqImputedCDR3 unique sequences
+    ## apply on each subset to take the list of unique sample id
+  res <- ClonotypeDf %>%
+      distinct(aaSeqImputedCDR3, .data[[id_column]], .data[[response_column]]) %>%  # 1 ligne / clonotype / patient
+      group_by(aaSeqImputedCDR3) %>%
+      summarise(
+        List_patients = paste(sort(unique(.data[[id_column]])), collapse = ","),
+        Nb_tumor = n_distinct(.data[[id_column]]),
+        Nb_R = sum(.data[[response_column]] == "R", na.rm = TRUE),
+        Nb_NR = sum(.data[[response_column]] == "NR", na.rm = TRUE),
+        Ratio_R = ifelse(Nb_tumor > 0, Nb_R / Nb_tumor, NA_real_),
+        Ratio_NR = ifelse(Nb_tumor > 0, Nb_NR / Nb_tumor, NA_real_),
+        .groups = "drop"
+      ) %>%
+      rename(CDR3aaSeq = aaSeqImputedCDR3) %>%
+      arrange(desc(Nb_tumor))
+
+  
+  return(res)
+}
+#Compute the number of unique CDR3aa counted in each patient.
+shared_clonotypes <- shared_clonotypes(clonotype_bulk_muts_bionikk)
+
+
+# table Nb clonotype shared and plot as barplot 
+df_plot<-table(Nb_tumor=shared_clonotypes$Nb_tumor)
+df_plot<-as.data.frame(df_plot)
+
+
+### Plot S12B
+p1 <- ggplot(df_plot,aes(x=Nb_tumor,y=Freq))+
+  geom_bar(stat="identity",color="black",fill="#1F78B4")+
+  geom_text(aes(label=Freq),color="white",nudge_y = -0.4)+
+  theme_bw()+
+  scale_y_continuous(trans="log1p",breaks = base_breaksLog1p(),labels = prettyNum)+
+  labs(x="Nb tumors sharing each unique aaCDR3",y="Unique IGH aaCDR3")
+
+ggsave(filename = paste0(res_folder,"S12B_MiXCR_RNAseq_IGHsharedTumorsICI_barplot.pdf"),
+       plot =p1, 
+       width =5 ,height =2)
+
+
+# Plot response ratio for each clonotype shared at least in 2 samples
+shared_clonotypes$Nb_tumor_factor<-factor(shared_clonotypes$Nb_tumor)
+
+medians <- shared_clonotypes %>%
+  group_by(Nb_tumor_factor) %>%
+  summarise(med_ratio = median(Ratio_R, na.rm = TRUE))
+
+p2<-ggplot(shared_clonotypes,aes(x=Nb_tumor_factor,y=Ratio_R))+
+  geom_hline(yintercept = 0.5,color="black")+
+  geom_violin()+
+  # fill=Nb_tumor_factor
+  # geom_boxplot()+
+  geom_jitter(aes(fill=Ratio_R),shape=21)+
+  # geom_line(data = medians, aes( y = med_ratio),
+  #           color = "red", linewidth = 1.2, alpha = 0.8) +
+  # geom_smooth(data = medians, aes( y = med_ratio),
+  #             method = "loess", se = FALSE, color = "red", linetype = "dashed") +
+  theme_bw()+
+  # theme(legend.position = "none")+
+  #  theme(
+  #   legend.position = "bottom",          # placer la légende en bas
+  #   # legend.title = element_text(size = 12),
+  #   # legend.text = element_text(size = 10),
+  #   # legend.key.width = unit(1.2, "cm"),  # ajuste la taille
+  #   # legend.key.height = unit(0.4, "cm"),
+  #       legend.direction = "horizontal"     # orientation horizontale
+  # )+
+    scale_fill_distiller(palette="RdYlGn",direction=+1)+
+  # scale_fill_viridis(option = "G",discrete = F)+
+    # scale_fill_viridis(option = "D",discrete = T)+
+  labs(x="Nb tumor sharing each unique aaCDR3",y="ICI-responders ratio")
+
+## Not in final paper
+# ggsave(filename = paste0(res_folder,"MiXCR_RNAseq_IGHsharedTumorsICI_ratioICIresponders_allClonotypeShared.pdf"),
+#        plot =p2, 
+#        width =5 ,height =2)
+
+# # patch
+# p<-(p1/p2)+plot_layout(axes = "collect",guides="collect")
+# 
+# ggsave(filename = paste0(res_folder,"MiXCR_RNAseq_IGHsharedTumorsICI_ratioICIresponders_allClonotypeShared_withNumber.pdf"),
+#        plot =p, 
+#        width =8 ,height =4.5)
+
+
+# Focus on most shared clonotypes (>4 tumor sharing / >3 tumor sharing ?) and represent as barplot for each clonotype the ratio_R / ratio_NR
+shared_clonotypes_3 <- shared_clonotypes[shared_clonotypes$Nb_tumor>=3,]
+shared_clonotypes_3<-shared_clonotypes_3[order(shared_clonotypes_3$Nb_tumor,shared_clonotypes_3$Ratio_R),]
+shared_clonotypes_3$CDR3aaSeq<-factor(shared_clonotypes_3$CDR3aaSeq,shared_clonotypes_3$CDR3aaSeq)
+shared_clonotypes_3 <- reshape::melt.data.frame(data.frame(shared_clonotypes_3[,c("CDR3aaSeq","Ratio_R","Ratio_NR","Nb_tumor_factor")]),id.vars = c("CDR3aaSeq","Nb_tumor_factor"))
+shared_clonotypes_3$variable<-factor(gsub("Ratio_","",as.character(shared_clonotypes_3$variable)),
+                                     levels = c("NR","R"))
+
+shared_clonotypes_3$Nb_tumor_factor <- factor(paste(as.character(shared_clonotypes_3$Nb_tumor_factor),"sharing"))
+
+p3<-ggplot(shared_clonotypes_3,aes(x=CDR3aaSeq,y=value))+
+  geom_col(aes(fill=variable))+
+  geom_hline(yintercept = 0.5,color="black")+
+  facet_wrap(~Nb_tumor_factor,drop = T,nrow = 1,scales = "free_x")+
+  scale_fill_manual(values = c(R="#00BA38",NR="#F8766D"))+
+  theme_minimal()+
+  theme(axis.text.x = element_blank(),
+        # axis.text.x = element_text(hjust=1,angle=15,size=6),
+        legend.position = "none")+
+  labs(y="ICI-response ratio",fill="ICI-response")
+
+### Figure S12C
+
+ggsave(filename = paste0(res_folder,"S12C_MiXCR_RNAseq_IGHsharedTumorsICI_ratioICIresponders_ClonotypeSharedMore3tumors.pdf"),
+       plot =p3, 
+       width =7 ,height =2)
+
+
+```
+
+**Figure S12A** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S12A_to_render_compressed.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure S12B** 
+```{r,fig.height=7,fig.width=5}
+img <- magick::image_read_pdf(paste0(res_folder,"S12B_MiXCR_RNAseq_IGHsharedTumorsICI_barplot.pdf"),density = 300)
+plot(img)
+```
+
+
+**Figure S12C** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S12C_MiXCR_RNAseq_IGHsharedTumorsICI_ratioICIresponders_ClonotypeSharedMore3tumors.pdf"),density = 300)
+plot(img)
+```
+
+
+## Figure 13A - CompAIRR IGH MH similarity scores heatmap
+
+```{r}
+### metadata heatmap
+HM_metadata <- Immcantation_meta_ICI_unique
+
+# plot all matrix with ComplexHeatmap
+
+#################################################################
+##  without clustering of row and columns + order by sample type and split by patients_id
+#################################################################
+## ordered id
+odereded_sampleid <-HM_metadata$sample_id[order(HM_metadata$R_NR,HM_metadata$patient_id,HM_metadata$sample_type,HM_metadata$sample_storage)] # initially also ordered according to ARM but not really important at the end ... Since it is a data not shared, the heatmap shape could be a little bit different, but it do not impact the violin comparisons
+
+## split factor
+anonym_id_ordered<-(gsub("_Tumor.*","",gsub("_PBMC.*","",odereded_sampleid)))
+if(!all(anonym_id_ordered %in% HM_metadata$patient_id))stop("must be T")
+anonym_id_ordered_u <- unique(anonym_id_ordered)
+anonym_id_ordered_u <- setNames(paste0("P",as.numeric(factor(anonym_id_ordered_u,levels=anonym_id_ordered_u))),
+                              nm = anonym_id_ordered_u) # just to simplify the plot with random number.
+
+# add in metadata
+HM_metadata$anonym_id <- anonym_id_ordered_u[HM_metadata$patient_id]
+
+# create an anonym spliter factor
+anonym_id_ordered <- anonym_id_ordered_u[anonym_id_ordered] # anonym
+spliter<-factor(anonym_id_ordered,unique(anonym_id_ordered))
+
+#### version without anonym_id
+AnnotationDf<-HM_metadata[,c("sample_type","R_NR")]
+
+
+AnnotationDf <- AnnotationDf[odereded_sampleid,,drop=F] #order df
+
+
+ColorPal<- list(Arm=c(`Nivo-Ipi`="#6A3D9A",
+                      Nivo="#1F78B4",
+                      TKI="#FFD92F"),
+                R_NR=c(R="#33A02C",
+                           NR="#E31A1C",
+                       HD="#CAB2D6"),
+                sample_storage=c(FFPE="darkgrey",
+                                 Frozen="#E7298A"),
+                sample_type=c(`Tumor.T0`="black",
+                         `PBMC.T0`="#FF7F00",
+                         `PBMC.T6`="#E31A1C",
+                         `Tonsil.T0`="#6A3D9A"))
+
+ha_top = ComplexHeatmap::HeatmapAnnotation(df = AnnotationDf,
+                                                      col = ColorPal, #To specify color of each categories in each variable (same as in pheatmap)
+                                                       # gp = gpar(col = "grey60"),
+                                                   annotation_name_gp = gpar(fontsize = 7),
+                                                   annotation_legend_param = list(title_gp=gpar(fontsize = 7),labels_gp=gpar(fontsize = 7)),
+                                           border = TRUE,
+                                                       show_legend = T) # To hide legend because they will be created manually
+  
+
+ha_row = ComplexHeatmap::rowAnnotation(df = AnnotationDf,
+                                                      col = ColorPal, #To specify color of each categories in each variable (same as in pheatmap)
+                                                       # gp = gpar(col = "grey60"),
+                                                   annotation_name_gp = gpar(fontsize = 7),
+                                                   annotation_legend_param = list(title_gp=gpar(fontsize = 7),labels_gp=gpar(fontsize = 7)),
+                                       border = TRUE,
+                                                       show_legend = F) # To hide legend because they will be created manually
+
+
+
+####
+# same ha but without legend
+####
+
+ha_top_noScale = ComplexHeatmap::HeatmapAnnotation(df = AnnotationDf,
+                                                      col = ColorPal, #To specify color of each categories in each variable (same as in pheatmap)
+                                                       # gp = gpar(col = "grey60"),
+                                                   annotation_name_gp = gpar(fontsize = 7),
+                                                   annotation_legend_param = list(title_gp=gpar(fontsize = 7),labels_gp=gpar(fontsize = 7)),
+                                           border = TRUE,
+                                           show_annotation_name = FALSE, # to hide names
+                                                       show_legend = F) # To hide legend because they will be created manually
+  
+
+ha_row_noScale = ComplexHeatmap::rowAnnotation(df = AnnotationDf,
+                                                      col = ColorPal, #To specify color of each categories in each variable (same as in pheatmap)
+                                                       # gp = gpar(col = "grey60"),
+                                                   annotation_name_gp = gpar(fontsize = 7),
+                                                   annotation_legend_param = list(title_gp=gpar(fontsize = 7),labels_gp=gpar(fontsize = 7)),
+                                       border = TRUE,
+                                       show_annotation_name = FALSE, # to hide names
+                                                       show_legend = F) # To hide legend because they will be created manually
+
+
+####
+
+
+## run loop
+#### initially run on all CompAIRR results but the final analysis was only done on MH Scores ... IGH
+vect_compairr <- names(compAirr_results)
+
+mat_name <- "IGH_MHscore"
+
+# for(mat_name in vect_compairr){
+    # retreive matrix
+    mat <-as.matrix(compAirr_results[[mat_name]])
+
+      # order matrix and define 
+    mat <- mat[odereded_sampleid,odereded_sampleid]
+    
+    #Check order
+    if(!identical(colnames((mat)),rownames(AnnotationDf)))stop("olala")
+
+    ## log scale
+    #log scale + pseudo_count
+  min_value<- min(mat[mat!=0]) # take the minimum non 0 value
+  min_value <- (formatC(min_value,format = "e",digits = 0)) # min value rounded to take the e-x power
+  min_value <- as.numeric(gsub("^.e","1e",min_value)) # round to 1e-x 
+  pseudoCount<-ifelse(max(mat)<=1,yes = min_value/10,no = 1) # Take pseudocount /10
+    mat_log <- log10(mat+pseudoCount) 
+    ## Retrieve values of breaks to make them annotated from log10 to raw values
+    breaks = seq(min(mat_log, na.rm = TRUE), max(mat_log, 
+                  na.rm = TRUE), length.out = 5)
+    rg = range(breaks)
+    diff = rg[2] - rg[1]
+    rg[1] = rg[1] + diff * 0.05
+    rg[2] = rg[2] - diff * 0.05
+    le = pretty(rg, n = 3)
+                
+   # plot heatmap
+    ## log scale
+    #### reùpve rownames and colnames
+    rownames(mat_log)<-NULL
+    colnames(mat_log)<-NULL
+    
+    #### adjust rownames and colnames with irrelevant anonym_id
+    # rownames(mat_log)<-NULL
+    # colnames(mat_log)<-NULL
+    
+    Heatmap <-ComplexHeatmap::Heatmap(matrix = mat_log, # The log matrix
+                                                  cluster_rows = F, # F  to avoid clustering
+                                                  cluster_columns = F,# F to avoid clustering
+                                                  # rect_gp = gpar(col = "grey60", lwd = 1),# to add a grid in the matrix which will be grey (same color as in pheatmap)
+                                                  name = paste(gsub("_","\n",mat_name),paste("+",pseudoCount),sep = "\n"), # Name of the matrix legend
+                                                  # column_title = paste0("Immunoverse- CompAIRR - ",gsub("_"," ",mat_name)), # To set the title of the heatmap
+                                                  column_title_gp = gpar( fontface = "bold",fontsize = 6), # To make the title in bold
+                                      row_title_gp = gpar( fontface = "bold",fontsize = 6), # To make the row title in bold
+                                      row_title_rot = 0  ,    # 0° = horizontal
+                                                  row_names_gp = gpar(fontsize = 5), # To reduce the size of the rownames (samples)
+                                                  column_names_gp = gpar(fontsize = 5), # To reduce the size of the colnames (samples)
+                                      # col=col_fun,
+                                      heatmap_legend_param = list(
+                                        labels_gp = gpar(fontsize = 7), 
+                                        title_gp = gpar(fontsize = 8, fontface = "bold"), 
+                                        at = le,
+                                        labels = as.character(10^le)
+                                      ), # adapt the log scale with original values
+  
+                                                column_split =spliter,
+                                      row_split = spliter,
+                                      border = TRUE,row_gap = unit(0, "mm"), column_gap = unit(0, "mm"), # remove white space but add border
+                                      # row_title = NULL,
+                                                top_annotation = ha_top,
+                                      left_annotation = ha_row,                                      na_col = "bisque4"#NA color
+                                      )
+  
+    #### THIS IS SUP S13A
+    
+  pdf(file = paste0(res_folder,"S13A_ComplexHeatmap_",mat_name,"_SortedID_log10_only96_ICIuniqueSamples.pdf"),width = 6,height = 6)
+    print(Heatmap)
+  dev.off()
+  
+  
+  
+  # same but without scale to have a square heatmap
+  Heatmap <-ComplexHeatmap::Heatmap(matrix = mat_log, # The log matrix
+                                                  cluster_rows = F, # F  to avoid clustering
+                                                  cluster_columns = F,# F to avoid clustering
+                                                  # rect_gp = gpar(col = "grey60", lwd = 1),# to add a grid in the matrix which will be grey (same color as in pheatmap)
+                                                  name = paste(gsub("_","\n",mat_name),paste("+",pseudoCount),sep = "\n"), # Name of the matrix legend
+                                                  # column_title = paste0("Immunoverse- CompAIRR - ",gsub("_"," ",mat_name)), # To set the title of the heatmap
+                                                  column_title_gp = gpar( fontface = "bold",fontsize = 8), # To make the title in bold
+                                      row_title_gp = gpar( fontface = "bold",fontsize = 8), # To make the row title in bold
+                                      row_title_rot = 0  ,    # 0° = horizontal
+                                    column_title_rot = 45  ,    # 45°
+                                                  row_names_gp = gpar(fontsize = 5), # To reduce the size of the rownames (samples)
+                                                  column_names_gp = gpar(fontsize = 5), # To reduce the size of the colnames (samples)
+                                      # col=col_fun,
+                                      heatmap_legend_param = list(
+                                        labels_gp = gpar(fontsize = 7), 
+                                        title_gp = gpar(fontsize = 8, fontface = "bold"), 
+                                        at = le,
+                                        labels = as.character(10^le)
+                                      ), # adapt the log scale with original values
+                                    show_heatmap_legend = FALSE,
+  
+                                                column_split =spliter,
+                                      row_split = spliter,
+                                      border = TRUE,row_gap = unit(0, "mm"), column_gap = unit(0, "mm"), # remove white space but add border
+                                      # row_title = NULL,
+                                                top_annotation = ha_top_noScale,
+                                      left_annotation = ha_row_noScale,                                      na_col = "bisque4"#NA color
+                                      )
+  
+  
+    pdf(file = paste0(res_folder,"S13A_ComplexHeatmap_",mat_name,"_SortedID_log10_only96_ICIuniqueSamples_noScales.pdf"),width = 6,height = 6)
+    print(Heatmap)
+  dev.off()
+  
+#}
+
+
+```
+
+**Figure S13A** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S13A_ComplexHeatmap_IGH_MHscore_SortedID_log10_only96_ICIuniqueSamples_noScales.pdf"),density = 300)
+plot(img)
+```
+
+
+
+## Figure 13B - CompAIRR IGH, IGL, IGK MH similarity scores distribution and comparison
+
+Compare overlap between sample_type or between responsive patients to ICI (subset needed) :
+
+- Split per patients. 
+- Get only the maximum or the median/mean of each value per patients  
+- ...
+
+```{r}
+# Reshape the matrix in a dataframe and annotate with Metadata
+compAirr_results_df <- lapply(compAirr_results,function(mat){
+  mat <- as.data.frame(mat)
+
+  # Melt
+  mat$sample_id <- rownames(mat)
+  mat <- reshape::melt.data.frame(mat,id.vars = "sample_id")
+  
+  # var as char
+  mat$variable<-as.character(mat$variable)
+  
+  # Remove the comparison of a sample with itself
+  mat <- mat[mat$sample_id!=mat$variable,]
+  
+  #  only unique value (do not duplicate : a-b == b-a)
+  mat$sample_combi_sorted_rm_dupli<-apply(mat[,c("sample_id","variable")],1,function(sample_ids)paste(sort(sample_ids),collapse = "_"))
+  mat<-mat[duplicated(mat$sample_combi_sorted_rm_dupli),]
+  
+  # retrieve sample_type from name and create a new factor
+  mat$sample_type1 <-gsub(".*Tumor","Tumor",gsub(".*PBMC","PBMC",(mat$sample_id)))
+  mat$sample_type2 <-gsub(".*Tumor","Tumor",gsub(".*PBMC","PBMC",as.character(mat$variable)))
+  ## sort to keep remove false "new" comparison type : a-b == b-a
+  mat$comparison_sampleType <- apply(mat[,c("sample_type1","sample_type2")],1,function(sample_type)paste(sort(sample_type),collapse = "_"))
+  
+  ## Level factor
+  mat$sample_type1<- factor(mat$sample_type1,levels = c("Tumor","PBMC_T0","PBMC_T6","PBMC_HD"))
+  mat$sample_type2<- factor(mat$sample_type2,levels = c("Tumor","PBMC_T0","PBMC_T6","PBMC_HD"))
+  mat$comparison_sampleType<-factor(mat$comparison_sampleType,
+                                    levels = c("Tumor_Tumor","PBMC_T0_Tumor","PBMC_T6_Tumor","PBMC_HD_Tumor",
+                                                "PBMC_T0_PBMC_T0","PBMC_HD_PBMC_T0","PBMC_HD_PBMC_HD",
+                                               "PBMC_T0_PBMC_T6", "PBMC_HD_PBMC_T6","PBMC_T6_PBMC_T6"))
+  
+  #return
+  return(mat)
+  
+})
+
+
+############################
+# Compare also response to ICI : R_R R_NR NR_NR R_HD, NR_ND, HD_HD to comparisons
+############################
+
+Response_to_ICI <- setNames(object = as.character(Immcantation_meta_ICI_unique$R_NR),
+                            nm = Immcantation_meta_ICI_unique$sample_id)
+
+# Tag df with response
+compAirr_results_df <- lapply(compAirr_results_df,function(df){
+
+  # Tag sample_id and variable (sample_id 2 ...) as R_NR_HD
+  df$R_NR_1 <- Response_to_ICI[df$sample_id]
+  df$R_NR_2 <- Response_to_ICI[as.character(df$variable)]
+  
+  ## sort to keep remove false "new" comparison type : a-b == b-a
+  df$comparison_R_NR <- apply(df[,c("R_NR_1","R_NR_2")],1,function(R_NR)paste(sort(R_NR),collapse = "_"))
+  
+  ## Level factor
+    # EDIT : adjust level of factor for homogneous color with R_R (green) NR_NR (red)
+  df$comparison_R_NR<-factor(df$comparison_R_NR,
+                                    levels = c("NR_NR","NR_R","R_R",
+                                                   "HD_NR","HD_R","HD_HD"
+                                               ))
+  
+  ## create a split factor according to comparinsons sample type
+  df$splitsample_type<-ifelse(grepl("Tumor",(df$comparison_sampleType)),yes ="Tumor" ,
+                              no = ifelse(df$comparison_sampleType=="PBMC_HD_PBMC_HD",yes = "Only_HD",no = "PBMC"))
+  df$splitsample_type<-factor(df$splitsample_type,levels = c("Tumor","PBMC","Only_HD"))
+  #return
+  return(df)
+  
+})
+
+# Plot all comparisons
+#### initially run on all CompAIRR results but the final analysis was only done on MH Scores ... IGH
+compAirr_variable<-setNames(names(compAirr_results_df),names(compAirr_results_df))
+
+compAirr_variable <- c("IGH_MHscore", "IGK_MHscore", "IGL_MHscore" ) # susbet of var analyzed in final article
+
+
+##### plot with response and remove all comparisons to HD 
+# plot with response
+for(var in compAirr_variable){
+  df<-compAirr_results_df[[var]]
+  
+  
+  #log scale + pseudo_count
+  min_value<- min(df$value[df$value!=0]) # take the minimum non 0 value
+  min_value <- (formatC(min_value,format = "e",digits = 0)) # min value rounded to take the e-x power
+  min_value <- as.numeric(gsub("^.e","1e",min_value)) # round to 1e-x 
+  pseudoCount<-ifelse(max(df$value)<=1,yes = min_value/10,no = 1) # Take pseucound /10
+
+  
+  # Remove comparisons to HD
+  df <- df[!grepl("HD",df$comparison_sampleType),]
+  
+  #Change colors according to previous barplot (ggplot number in TLSpos vs TLSneg)
+  ##Get the color of the ggplot (stack overflow :https://stackoverflow.com/questions/8197559/emulate-ggplot2-default-color-palette)
+  gg_color_hue <- function(n) {
+    hues = seq(15, 375, length = n + 1)
+    hcl(h = hues, l = 65, c = 100)[1:n]
+  }
+  gg_Colors<-gg_color_hue(7)
+  gg_Colors<-gg_Colors[1:3]
+  names(gg_Colors)<-c("NR_NR","NR_R","R_R")
+  
+  ## general plot
+  plot<-ggplot(df,aes(x=comparison_sampleType,y=value+pseudoCount,fill=comparison_R_NR))+
+    geom_violin(draw_quantiles = 0.5)+
+    # geom_jitter(alpha=0.2,size=0.2)+
+    stat_compare_means(label = "p.signif")+
+      facet_grid(.~splitsample_type,scales = "free_x",space = "free")+
+
+    scale_y_continuous(trans = "log10",labels = prettyNum)+
+    theme_minimal() +
+    # theme_bw() +
+    scale_fill_manual(values =gg_Colors )+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+    labs(title = paste("CompAIRR repertoire comparisons"),
+         # subtitle = "All comparisons from ICI-treated unique or HD samples - Remove comparison of a sample to itself and duplicated comparisons (a-b == b-a)",
+         y=paste(var,"+",pseudoCount),x=NULL)
+  
+  
+  #### THIS IS SUP FIGURE S13B (for IGH/IGK/IGL)
+  
+  ggsave(filename = paste0(res_folder,"S13B_Violin_OnlyICItreatedSamples_stat_compareSampleType_and_Response_",var,"_NoHDsamples.pdf"),
+         plot = plot,
+         width = 6,height = 4)
+
+  
+}
+
+```
+
+**Figure S13B (IGK)** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S13B_Violin_OnlyICItreatedSamples_stat_compareSampleType_and_Response_IGK_MHscore_NoHDsamples.pdf"),density = 300)
+plot(img)
+```
+
+**Figure S13B (IGL)** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S13B_Violin_OnlyICItreatedSamples_stat_compareSampleType_and_Response_IGL_MHscore_NoHDsamples.pdf"),density = 300)
+plot(img)
+```
+
+**Figure S13B (IGH)** 
+```{r,fig.height=7,fig.width=7}
+img <- magick::image_read_pdf(paste0(res_folder,"S13B_Violin_OnlyICItreatedSamples_stat_compareSampleType_and_Response_IGH_MHscore_NoHDsamples.pdf"),density = 300)
+plot(img)
+```
+
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
