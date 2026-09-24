@@ -228,13 +228,25 @@ Reload data
 
 ```{r}
 # Metadata ANONYMIZED - NB : Response to ICI is not shared due to patient privacy requirement but can be asked to the study sponsor unpon reasonable request (see article for contact)
-Immcantation_meta_ICI_unique <-readRDS(paste0("PATH/","20260727_Immunoverse_Metadata_AnonymId_ICIresponse_IgTumorCells.rds")) # edit : study sponsor accepted to share the information
+# Immcantation_meta_ICI_unique <-readRDS(paste0("PATH/","20260727_Immunoverse_Metadata_AnonymId_ICIresponse_IgTumorCells.rds")) # edit : study sponsor accepted to share the information
+Immcantation_meta_ICI_unique <- read.csv(paste0(res_folder,"20260727_Immunoverse_Metadata_AnonymId_ICIresponse_IgTumorCells.csv"),row.names = 1) # use csv since EGA refused rds
+## Generate back factors ...
+Immcantation_meta_ICI_unique$sample_origin <- factor(Immcantation_meta_ICI_unique$sample_origin,levels = c("Tumor" ,"PBMC" ))
+Immcantation_meta_ICI_unique$sample_timepoint <- factor(Immcantation_meta_ICI_unique$sample_timepoint,levels = c("T0" ,"T6" ))
+Immcantation_meta_ICI_unique$sample_type <- factor(Immcantation_meta_ICI_unique$sample_type,levels = c("Tumor.T0" ,"PBMC.T0" ,"PBMC.T6"))
+Immcantation_meta_ICI_unique$sample_type2 <- factor(Immcantation_meta_ICI_unique$sample_type2,levels = c("Tumor.T0" ,"PBMC.T0" ,"PBMC.T6","PBMC.HD"))
+Immcantation_meta_ICI_unique$R_NR <- factor(Immcantation_meta_ICI_unique$R_NR,levels = c("NR" ,"R" ,"HD"))
+
 
 
 #reload clone abundance and diversity for all IGH clones
 ## Same as in previous script (Figure 4)
-abund_list <- readRDS(paste0("PATH/","20260724_Immcantation_IGH_clonal_alakazamEstimateAbundance_Unweighted_Uniform_anonymized.rds"))
-div <- readRDS(paste0("PATH/","20260724_Immcantation_IGH_clonal_alakazamAlphaDiversity_Unweighted_Uniform_anonymized.rds"))
+# abund_list <- readRDS(paste0("PATH/","20260724_Immcantation_IGH_clonal_alakazamEstimateAbundance_Unweighted_Uniform_anonymized.rds"))
+abund_list <- read.csv(paste0("PATH/","20260724_Immcantation_IGH_clonal_alakazamEstimateAbundance_Unweighted_Uniform_anonymized.csv")) # use csv since EGA refused rds
+
+# div <- readRDS(paste0("PATH/","20260724_Immcantation_IGH_clonal_alakazamAlphaDiversity_Unweighted_Uniform_anonymized.rds"))
+div <- read.csv(paste0("PATH/","20260724_Immcantation_IGH_clonal_alakazamAlphaDiversity_Unweighted_Uniform_anonymized.csv")) # use csv since EGA refused rds
+
 
 
 ```

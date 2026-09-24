@@ -2441,37 +2441,57 @@ Reload data
 
 ```{r}
 # Metadata ANONYMIZED - NB : Response to ICI is not shared due to patient privacy requirement but can be asked to the study sponsor unpon reasonable request (see article for contact)
-Immcantation_meta_ICI_unique <-readRDS(paste0("PATH/","20260723_Immunoverse_Metadata_AnonymId_ICIresponse.rds")) # edit : study sponsor accepted to share the information
+# Immcantation_meta_ICI_unique <-readRDS(paste0("PATH/","20260723_Immunoverse_Metadata_AnonymId_ICIresponse.rds")) # edit : study sponsor accepted to share the information
+Immcantation_meta_ICI_unique <- read.csv(paste0(res_folder,"20260723_Immunoverse_Metadata_AnonymId_ICIresponse.csv"),row.names = 1) # use csv since EGA refused rds
+## Generate back factors ...
+Immcantation_meta_ICI_unique$sample_origin <- factor(Immcantation_meta_ICI_unique$sample_origin,levels = c("Tumor" ,"PBMC" ))
+Immcantation_meta_ICI_unique$sample_timepoint <- factor(Immcantation_meta_ICI_unique$sample_timepoint,levels = c("T0" ,"T6" ))
+Immcantation_meta_ICI_unique$sample_type <- factor(Immcantation_meta_ICI_unique$sample_type,levels = c("Tumor.T0" ,"PBMC.T0" ,"PBMC.T6"))
+Immcantation_meta_ICI_unique$sample_type2 <- factor(Immcantation_meta_ICI_unique$sample_type2,levels = c("Tumor.T0" ,"PBMC.T0" ,"PBMC.T6","PBMC.HD"))
+Immcantation_meta_ICI_unique$R_NR <- factor(Immcantation_meta_ICI_unique$R_NR,levels = c("NR" ,"R" ,"HD"))
 
 
 ### airr dataset of all clonotypes (light chain and heavy chains) with anonymized id - lot of  memory necessary 
 #### Not directly necessary to reproduce plot because count of clonotypes are in the metadata
 # airr_imm_db<-readRDS(paste0(res_folder,"20260724_Immcantation_clonotypes_IGHKL_merged_AllSamples_anonymized.rds"))
+# airr_imm_db <- airr::read_rearrangement(paste0(res_folder,"20260724_Immcantation_clonotypes_IGHKL_merged_AllSamples_anonymized.tsv")) # use tsv since EGA refused rds
+
 
 #### airr dataset of all IGH clonotypes with clone_id identifier
-Igh_imm_db<-readRDS(paste0(res_folder,"20260724_Immcantation_IGH_clonal_grouped_merged_AllSamples_anonymized.rds"))
+# Igh_imm_db<-readRDS(paste0(res_folder,"20260724_Immcantation_IGH_clonal_grouped_merged_AllSamples_anonymized.rds"))
+Igh_imm_db <- airr::read_rearrangement(paste0(res_folder,"20260724_Immcantation_IGH_clonal_grouped_merged_AllSamples_anonymized.tsv")) # use tsv since EGA refused rds
+
 
 # Create a sub annotated with all sample related metadata and filter only ICI
 Igh_imm_db_ICIunique<-merge(Igh_imm_db,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type" ,"sample_type2","R_NR")],by="sample_id")
 
 #reload clone abundance and diversity for all IGH clones
-abund_allIGH <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_clonal_alakazamEstimateAbundance_Unweighted_Uniform_anonymized.rds"))
-div_allIGH <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_clonal_alakazamAlphaDiversity_Unweighted_Uniform_anonymized.rds"))
+# abund_allIGH <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_clonal_alakazamEstimateAbundance_Unweighted_Uniform_anonymized.rds"))
+abund_allIGH <- read.csv(paste0(res_folder,"20260724_Immcantation_IGH_clonal_alakazamEstimateAbundance_Unweighted_Uniform_anonymized.csv")) # use csv since EGA refused rds
+# div_allIGH <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_clonal_alakazamAlphaDiversity_Unweighted_Uniform_anonymized.rds"))
+div_allIGH <- read.csv(paste0(res_folder,"20260724_Immcantation_IGH_clonal_alakazamAlphaDiversity_Unweighted_Uniform_anonymized.csv")) # use csv since EGA refused rds
+
 
 
 #reload clone abundance and diversity only for class-switched IGH clones
-abund_ClassSwitch <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min1000seqFilter_anonymized.rds"))
-div_ClassSwitch <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min1000seqFilter_anonymized.rds"))
+# abund_ClassSwitch <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min1000seqFilter_anonymized.rds"))
+abund_ClassSwitch <- read.csv(paste0(res_folder,"20260724_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min1000seqFilter_anonymized.csv")) # use csv since EGA refused rds
+# div_ClassSwitch <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min1000seqFilter_anonymized.rds"))
+div_ClassSwitch <- read.csv(paste0(res_folder,"20260724_Immcantation_IGH_ONLY_SWITCHED_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min1000seqFilter_anonymized.csv")) # use csv since EGA refused rds
 
 
 #reload clone abundance and diversity only for IgGs only IGH clones
-abund_IgGs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgGs_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
-div_IgGs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgGs_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+# abund_IgGs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgGs_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+abund_IgGs <- read.csv(paste0(res_folder,"20260724_Immcantation_IGH_IgGs_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min500seqFilter_anonymized.csv")) # use csv since EGA refused rds
+# div_IgGs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgGs_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+div_IgGs <- read.csv(paste0(res_folder,"20260724_Immcantation_IGH_IgGs_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min500seqFilter_anonymized.csv")) # use csv since EGA refused rds
 
 
 #reload clone abundance and diversity only for IgAs only IGH clones
-abund_IgAs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgAs_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
-div_IgAs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgAs_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+# abund_IgAs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgAs_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+abund_IgAs <- read.csv(paste0(res_folder,"20260724_Immcantation_IGH_IgAs_clonal_alakazamEstimateAbundance_Unweighted_Uniform_min500seqFilter_anonymized.csv")) # use csv since EGA refused rds
+# div_IgAs <- readRDS(paste0(res_folder,"20260724_Immcantation_IGH_IgAs_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min500seqFilter_anonymized.rds"))
+div_IgAs <- read.csv(paste0(res_folder,"20260724_Immcantation_IGH_IgAs_clonal_alakazamAlphaDiversity_Unweighted_Uniform_min500seqFilter_anonymized.csv")) # use csv since EGA refused rds
 
 ```
 

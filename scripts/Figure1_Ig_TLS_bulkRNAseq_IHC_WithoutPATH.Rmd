@@ -549,12 +549,27 @@ saveRDS(object = TLSsign,file = "PATH/TLS_signatures.rds" )
 ```{r,eval=FALSE}
 # Reload STAR aligned, DESeq2 normalized, VST transformed rnaseq data on frozen samples
 rnaseqFrozen<- readRDS(file = "PATH/bionikk_fiveprime_star_vst_normalized_expression.rds")
+
+# NB: this file was named Bionikk_rnaseq_star_vst_normalized_expression_anonym.rds after anonymization
+# rnaseqFrozen<- readRDS(file = paste0(res_folder,"Bionikk_rnaseq_star_vst_normalized_expression_anonym.rds"))
+rnaseqFrozen <- read.csv(paste0(res_folder,"Bionikk_rnaseq_star_vst_normalized_expression_anonym.csv"),row.names = 1) # use csv since EGA refused rds
+
+
 rnaseqFrozen<-as.matrix(rnaseqFrozen)
 
 # run GSVA base method on vst transformed expression value (does not care which one because the gsva method depend on rank ...)
 
 # Load TLS signatures and check that all id are correct
-TLSsign <- readRDS("PATH/TLS_signatures.rds")
+# TLSsign <- readRDS("PATH/TLS_signatures.rds")
+# ## convert in csv since EGA does not accept rds ...
+# lengthMax <- max(sapply(TLSsign,length))# get the size of the longest signature
+# TLSsign <- sapply(TLSsign,function(sign)c(sign,rep(NA,times=lengthMax-length(sign))))## complete all signature with NA up to lengthMax > convert in matrix with sapply
+# TLSsign <- as.data.frame(TLSsign)
+# write.csv(TLSsign,file = paste0(res_folder,"TLS_signatures.csv"),row.names = F) # convert from rds to csv as EGA refused rds ...
+TLSsign <- read.csv(paste0(res_folder,"TLS_signatures.csv")) # use csv since EGA refused rds
+TLSsign <- apply(TLSsign,2,function(sign)as.character(na.omit(sign))) # get back as a correct list in input of GSVA
+
+
 all(unique(Reduce(c,TLSsign)) %in% rownames(rnaseqFrozen))
 ## "AC103591.3" not in the database which is a LncRNA ... then ok
 ## "IGLC1" not in the database but all other IGLC are found ... (IGLC2,3,4,5,6,7) ... Weird but probably an issue of alignment / filtering
@@ -605,7 +620,8 @@ Import Bionikk_metadata (anonymized) with TLS signatures/count/density values
 
 ```{r}
 
-Bionikk_metadata <- readRDS(paste0(res_folder,"Bionikk_metadata_anonym.rds"))
+# Bionikk_metadata <- readRDS(paste0(res_folder,"Bionikk_metadata_anonym.rds"))
+Bionikk_metadata <- read.csv(paste0(res_folder,"Bionikk_metadata_anonym.csv")) # use csv since EGA refused rds
 
 ## NB: TLS categories were generated in another table an inserted in the bionikk metadata. categories were built as follow :
 
@@ -628,7 +644,10 @@ Bionikk_metadata$ID_PMRfrozen <- paste(Bionikk_metadata$Anonym_ID,Bionikk_metada
 
 ```{r}
 # reload full data
-clonotype_bulk_muts_bionikk <- readRDS(file = paste0(res_folder,"clonotype_bulk_muts_bionikk_merged.rds"))
+# clonotype_bulk_muts_bionikk <- readRDS(file = paste0(res_folder,"clonotype_bulk_muts_bionikk_merged.rds"))
+clonotype_bulk_muts_bionikk <- read.csv(paste0(res_folder,"clonotype_bulk_muts_bionikk_merged.csv")) # use csv since EGA refused rds
+
+
 
 # define levels of chains (here named type ...)
 clonotype_bulk_muts_bionikk$type <- factor(clonotype_bulk_muts_bionikk$type,

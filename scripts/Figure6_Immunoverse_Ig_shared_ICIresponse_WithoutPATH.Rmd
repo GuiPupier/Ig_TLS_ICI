@@ -525,11 +525,23 @@ Reload data
 
 ```{r}
 # Metadata ANONYMIZED - NB : Response to ICI is not shared due to patient privacy requirement but can be asked to the study sponsor unpon reasonable request (see article for contact)
-Immcantation_meta_ICI_unique <-readRDS(paste0("PATH/","20260723_Immunoverse_Metadata_AnonymId_ICIresponse.rds")) # edit : study sponsor accepted to share the information
+# Immcantation_meta_ICI_unique <-readRDS(paste0("PATH/","20260723_Immunoverse_Metadata_AnonymId_ICIresponse.rds")) # edit : study sponsor accepted to share the information
+Immcantation_meta_ICI_unique <- read.csv(paste0("PATH/","20260723_Immunoverse_Metadata_AnonymId_ICIresponse.csv"),row.names = 1) # use csv since EGA refused rds
+## Generate back factors ...
+Immcantation_meta_ICI_unique$sample_origin <- factor(Immcantation_meta_ICI_unique$sample_origin,levels = c("Tumor" ,"PBMC" ))
+Immcantation_meta_ICI_unique$sample_timepoint <- factor(Immcantation_meta_ICI_unique$sample_timepoint,levels = c("T0" ,"T6" ))
+Immcantation_meta_ICI_unique$sample_type <- factor(Immcantation_meta_ICI_unique$sample_type,levels = c("Tumor.T0" ,"PBMC.T0" ,"PBMC.T6"))
+Immcantation_meta_ICI_unique$sample_type2 <- factor(Immcantation_meta_ICI_unique$sample_type2,levels = c("Tumor.T0" ,"PBMC.T0" ,"PBMC.T6","PBMC.HD"))
+Immcantation_meta_ICI_unique$R_NR <- factor(Immcantation_meta_ICI_unique$R_NR,levels = c("NR" ,"R" ,"HD"))
+
+
 
 
 ## load igh clonotype table with clonal group updated 
-Igh_ICIunique_clonalGroup <- readRDS(paste0(res_folder,"20260728_Immcantation_IGH_clonal_grouped_merged_AllSamples_AdjustFor2ndGrouping_clone-pass_germ-pass_anonymized.rds"))
+# Igh_ICIunique_clonalGroup <- readRDS(paste0(res_folder,"20260728_Immcantation_IGH_clonal_grouped_merged_AllSamples_AdjustFor2ndGrouping_clone-pass_germ-pass_anonymized.rds"))
+Igh_ICIunique_clonalGroup <- airr::read_rearrangement(paste0(res_folder,"20260728_Immcantation_IGH_clonal_grouped_merged_AllSamples_AdjustFor2ndGrouping_clone-pass_germ-pass_anonymized.tsv")) # use tsv since EGA refused rds
+
+
 
 ## Merge with metadata containing notably response to ICI (to reproduce Figure 6)
 Igh_ICIunique_clonalGroup<-merge(Igh_ICIunique_clonalGroup,Immcantation_meta_ICI_unique[,c("sample_id","patient_id","sample_origin","sample_timepoint","sample_type" ,"sample_type2","R_NR")],by="sample_id")
@@ -538,7 +550,9 @@ Igh_ICIunique_clonalGroup<-merge(Igh_ICIunique_clonalGroup,Immcantation_meta_ICI
 # reload full dataset of bulk RNAseq on frozen tumors (MiXCR reconstruction, see Figure1) > Used in S12 figure
 OrderIso <- c("IGHM","IGHD","IGHG3","IGHG1","IGHA1","IGHG2","IGHG4","IGHE","IGHA2","IGH_NA")
 
-clonotype_bulk_muts_bionikk <- readRDS(file = paste0("PATH/","clonotype_bulk_muts_bionikk_merged.rds"))
+# clonotype_bulk_muts_bionikk <- readRDS(file = paste0("PATH/","clonotype_bulk_muts_bionikk_merged.rds"))
+clonotype_bulk_muts_bionikk <- read.csv(paste0("PATH/","clonotype_bulk_muts_bionikk_merged.csv")) # use csv since EGA refused rds
+
 # define levels of chains (here named type ...)
 clonotype_bulk_muts_bionikk$type <- factor(clonotype_bulk_muts_bionikk$type,
                                            levels = c("IGH","IGK" ,"IGL" ,
@@ -551,7 +565,13 @@ clonotype_bulk_muts_bionikk$isotype <- factor(clonotype_bulk_muts_bionikk$isotyp
 
 
 ### CompAIRR results >> Figure S13
-compAirr_results<- readRDS(paste0(res_folder,"20260728_CompAIRR_results_list_anonymized.rds"))
+# compAirr_results<- readRDS(paste0(res_folder,"20260728_CompAIRR_results_list_anonymized.rds"))
+compAirr_IGH <- read.csv(paste0(res_folder,"20260728_CompAIRR_results_IGH_MHscore_anonymized.csv"),row.names = 1) # use csv since EGA refused rds
+compAirr_IGK <- read.csv(paste0(res_folder,"20260728_CompAIRR_results_IGK_MHscore_anonymized.csv"),row.names = 1) # use csv since EGA refused rds
+compAirr_IGL <- read.csv(paste0(res_folder,"20260728_CompAIRR_results_IGL_MHscore_anonymized.csv"),row.names = 1) # use csv since EGA refused rds
+compAirr_results <- list(IGH_MHscore=compAirr_IGH,
+                         IGK_MHscore=compAirr_IGK,
+                         IGL_MHscore=compAirr_IGL)
 
 ```
 

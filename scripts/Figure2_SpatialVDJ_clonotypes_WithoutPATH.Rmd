@@ -3896,7 +3896,14 @@ Reload the Seurat file for the 4 slides containings all agregated metadata added
 combined <- readRDS(paste0(res_folder,"20260721_Seurat_merged_SpatialGEX_annotated_metadata.rds"))
 
 # TLS signatures
-TLSsign <- readRDS("PATH/TLS_signatures.rds")
+# TLSsign <- readRDS("PATH/TLS_signatures.rds")
+# ## convert in csv since EGA does not accept rds ...
+# lengthMax <- max(sapply(TLSsign,length))# get the size of the longest signature
+# TLSsign <- sapply(TLSsign,function(sign)c(sign,rep(NA,times=lengthMax-length(sign))))## complete all signature with NA up to lengthMax > convert in matrix with sapply
+# TLSsign <- as.data.frame(TLSsign)
+# write.csv(TLSsign,file = paste0(res_folder,"TLS_signatures.csv"),row.names = F) # convert from rds to csv as EGA refused rds ...
+TLSsign <- read.csv(paste0(res_folder,"TLS_signatures.csv")) # use csv since EGA refused rds
+TLSsign <- apply(TLSsign,2,function(sign)as.character(na.omit(sign))) # get back as a correct list in input of GSVA
 
 
   # ORder IGH iso
@@ -3912,7 +3919,10 @@ airr$sampleid<-factor(airr$sampleid,levels = Anonym_table$Anonym_id)
 
 
 # Load mixcr reconstructed clonotypes from 12 ccRCC spatial transcriptomics V1 from Meylan et al, 2022
-clonotype_spatial_mut_Immunity12ccRCC <- readRDS(file = paste0(res_folder,"20260722_clonotype_spatial_mut_Immunity12ccRCC_anonymized.rds"))
+# clonotype_spatial_mut_Immunity12ccRCC <- readRDS(file = paste0(res_folder,"20260722_clonotype_spatial_mut_Immunity12ccRCC_anonymized.rds"))
+clonotype_spatial_mut_Immunity12ccRCC <- read.csv(paste0(res_folder,"20260722_clonotype_spatial_mut_Immunity12ccRCC_anonymized.csv")) # use csv since EGA refused rds
+
+
 
 # Add isotype column
 clonotype_spatial_mut_Immunity12ccRCC$isotype <-substr(clonotype_spatial_mut_Immunity12ccRCC[,"allCHitsWithScore"],start = 1,stop =5)
